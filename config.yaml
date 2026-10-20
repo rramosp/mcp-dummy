@@ -1,0 +1,46 @@
+# Overall configuration for deploying the ADK Agent to Vertex AI Agent Engine
+# with a deterministic Static Outbound IP for all calls to the remote MCP server.
+#
+# Usage:
+#   ./manage-static-agent deploy
+#   ./manage-static-agent describe
+#   ./manage-static-agent send "Greet Raul and check what IP the MCP server sees"
+#   ./manage-static-agent undeploy
+
+gcp:
+  project_id: "genai-dev-454121"
+  # Must be one of the 23 Vertex AI Agent Engine supported regions:
+  #   Americas: us-central1, us-east1, us-east4, us-west1, northamerica-northeast1, northamerica-northeast2, southamerica-east1
+  #   Europe:   europe-west1, europe-west2, europe-west3, europe-west4, europe-west6, europe-west8, europe-southwest1
+  #   APAC/ME:  asia-east1, asia-east2, asia-northeast1, asia-northeast3, asia-south1, asia-southeast1, asia-southeast2, australia-southeast2, me-west1
+  region: "us-east1"
+  # Must be a valid zone inside `region` (defaults to `<region>-b` if omitted; note us-east1 and europe-west1 have no `-a` zone).
+  zone: "us-east1-b"
+
+agent:
+  name: "hello-mcp-agent"
+  description: "Hello World MCP Agent on Vertex AI Agent Engine with static egress IP"
+  source_dir: "./hello-mcp-agent"
+  # Available Vertex AI Gemini models: gemini-2.5-flash, gemini-2.5-pro, gemini-2.5-flash-lite, gemini-3-flash-preview, gemini-3.1-pro-preview
+  model: "gemini-3.8-flash"
+  min_instances: 1
+  max_instances: 10
+  cpu: "4"
+  memory: "8Gi"
+  concurrency: 9
+
+mcp_server:
+  # Remote Hello World MCP server endpoint (not deployed here; assumed already running).
+  url: "http://35.186.182.189:8080/mcp"
+  transport: "streamable-http"  # "streamable-http" or "sse"
+
+networking:
+  # Naming prefix for the VPC, subnets, PSC Network Attachment, Egress Proxy VM,
+  # Cloud Router, Cloud NAT, and reserved Static External IP.
+  resource_prefix: "hello-mcp-static"
+  psc_subnet_cidr: "192.168.10.0/28"
+  proxy_subnet_cidr: "10.10.10.0/28"
+  proxy_internal_ip: "10.10.10.2"
+  proxy_port: 8888
+  proxy_machine_type: "e2-micro"
+  dns_peering_domain: "mcp.internal."

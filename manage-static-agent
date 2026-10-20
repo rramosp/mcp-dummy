@@ -1,0 +1,1599 @@
+#!/usr/bin/env python3
+"""Manage Terraform deployment of the ADK Agent on Vertex AI Agent Engine with a Static Outbound IP.
+
+Commands:
+  manage-static-agent preflight Run preflight checks (permissions, APIs, service agents, org policies)
+  manage-static-agent deploy    Run preflight checks and deploy the agent + static-IP GCP services via Terraform
+  manage-static-agent describe  Describe the deployment, static IP, agent endpoints, and GCP components
+  manage-static-agent undeploy  Undeploy and clean up the agent and all GCP resources via Terraform
+  manage-static-agent send      Send a user prompt to the deployed agent and display the response
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import fnmatch
+import gzip
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
+from typing import Any
+
+# Self-bootstrap into hello-mcp-agent/.venv/bin/python if available so yaml,
+# requests, google-auth, etc. are guaranteed to be importable.
+SCRIPT_DIR = Path(__file__).resolve().parent
+VENV_DIR = SCRIPT_DIR / "hello-mcp-agent" / ".venv"
+VENV_PYTHON = VENV_DIR / "bin" / "python"
+if VENV_PYTHON.exists() and Path(sys.prefix).resolve() != VENV_DIR.resolve():
+    os.execv(
+        str(VENV_PYTHON),
+        [str(VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
+
+from google import genai
+import google.auth
+import google.auth.transport.requests
+import requests
+import yaml
+
+DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.yaml"
+TERRAFORM_DIR = SCRIPT_DIR / "terraform"
+BUILD_DIR = TERRAFORM_DIR / ".build"
+ARCHIVE_PATH = BUILD_DIR / "agent_source.tar.gz"
+TFVARS_PATH = TERRAFORM_DIR / "terraform.tfvars.json"
+METADATA_PATH = SCRIPT_DIR / "hello-mcp-agent" / "deployment_metadata.json"
+
+CANDIDATE_VERTEX_GEMINI_MODELS = (
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-3.1-pro-preview",
+)
+
+_EXCLUDED_DIRS = {
+    ".git",
+    ".venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".adk",
+    ".google-agents-cli",
+    ".terraform",
+    "node_modules",
+    ".mypy_cache",
+    ".ruff_cache",
+}
+_EXCLUDED_FILE_PATTERNS = (
+    ".git",
+    ".gcloudignore",
+    ".gitignore",
+    "*.pyc",
+    "*.pyo",
+    "*.tfstate",
+    "*.tfstate.*",
+    ".env",
+    "deployment_metadata.json",
+)
+
+SUPPORTED_AGENT_ENGINE_REGIONS = {
+    # Americas
+    "us-central1": ("a", "b", "c", "f"),
+    "us-east1": ("b", "c", "d"),  # No us-east1-a
+    "us-east4": ("a", "b", "c"),
+    "us-west1": ("a", "b", "c"),
+    "northamerica-northeast1": ("a", "b", "c"),
+    "northamerica-northeast2": ("a", "b", "c"),
+    "southamerica-east1": ("a", "b", "c"),
+    # Europe
+    "europe-west1": ("b", "c", "d"),  # No europe-west1-a
+    "europe-west2": ("a", "b", "c"),
+    "europe-west3": ("a", "b", "c"),
+    "europe-west4": ("a", "b", "c"),
+    "europe-west6": ("a", "b", "c"),
+    "europe-west8": ("a", "b", "c"),
+    "europe-southwest1": ("a", "b", "c"),
+    # Asia-Pacific & Middle East
+    "asia-east1": ("a", "b", "c"),
+    "asia-east2": ("a", "b", "c"),
+    "asia-northeast1": ("a", "b", "c"),
+    "asia-northeast3": ("a", "b", "c"),
+    "asia-south1": ("a", "b", "c"),
+    "asia-southeast1": ("a", "b", "c"),
+    "asia-southeast2": ("a", "b", "c"),
+    "australia-southeast2": ("a", "b", "c"),
+    "me-west1": ("a", "b", "c"),
+}
+
+REQUIRED_APIS = [
+    "aiplatform.googleapis.com",
+    "compute.googleapis.com",
+    "dns.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "run.googleapis.com",
+    "storage.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "iam.googleapis.com",
+    "serviceusage.googleapis.com",
+    "logging.googleapis.com",
+    "cloudtrace.googleapis.com",
+    "telemetry.googleapis.com",
+]
+
+# Maps each required permission to the recommended IAM role a Project Admin should grant
+PERMISSION_TO_ROLE = {
+    "resourcemanager.projects.get": "roles/viewer",
+    "resourcemanager.projects.getIamPolicy": "roles/resourcemanager.projectIamAdmin",
+    "resourcemanager.projects.setIamPolicy": "roles/resourcemanager.projectIamAdmin",
+    "serviceusage.services.enable": "roles/serviceusage.serviceUsageAdmin",
+    "serviceusage.services.list": "roles/serviceusage.serviceUsageAdmin",
+    "iam.serviceAccounts.create": "roles/iam.serviceAccountAdmin",
+    "iam.serviceAccounts.get": "roles/iam.serviceAccountAdmin",
+    "iam.serviceAccounts.actAs": "roles/iam.serviceAccountUser",
+    "compute.networks.create": "roles/compute.networkAdmin",
+    "compute.subnetworks.create": "roles/compute.networkAdmin",
+    "compute.networkAttachments.create": "roles/compute.networkAdmin",
+    "compute.routers.create": "roles/compute.networkAdmin",
+    "compute.addresses.create": "roles/compute.networkAdmin",
+    "compute.firewalls.create": "roles/compute.securityAdmin",
+    "compute.instances.create": "roles/compute.instanceAdmin.v1",
+    "dns.managedZones.create": "roles/dns.admin",
+    "storage.buckets.create": "roles/storage.admin",
+    "aiplatform.reasoningEngines.create": "roles/aiplatform.admin",
+    "aiplatform.reasoningEngines.get": "roles/aiplatform.admin",
+    "aiplatform.reasoningEngines.update": "roles/aiplatform.admin",
+    "aiplatform.reasoningEngines.delete": "roles/aiplatform.admin",
+}
+
+
+def _find_terraform_bin() -> str:
+    """Locate a Terraform >= 1.0 binary."""
+    candidates = [
+        shutil.which("terraform"),
+        str(Path.home() / ".terraform" / "bin" / "terraform"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise SystemExit(
+        "Error: 'terraform' binary not found on PATH or in ~/.terraform/bin/terraform."
+    )
+
+
+def _load_config(config_path: Path) -> dict[str, Any]:
+    if not config_path.exists():
+        raise SystemExit(f"Error: Configuration file not found: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    gcp = data.get("gcp") or {}
+    agent = data.get("agent") or {}
+    mcp_server = data.get("mcp_server") or {}
+    networking = data.get("networking") or {}
+
+    if not gcp.get("project_id"):
+        raise SystemExit("Error: 'gcp.project_id' is required in config.yaml")
+    if not mcp_server.get("url"):
+        raise SystemExit("Error: 'mcp_server.url' is required in config.yaml")
+
+    region = str(gcp.get("region", "us-east1")).strip()
+    if region not in SUPPORTED_AGENT_ENGINE_REGIONS:
+        supported_list = ", ".join(sorted(SUPPORTED_AGENT_ENGINE_REGIONS))
+        raise SystemExit(
+            f"Error: Unsupported gcp.region '{region}' for Vertex AI Agent Engine.\n"
+            f"Supported regions ({len(SUPPORTED_AGENT_ENGINE_REGIONS)}): {supported_list}"
+        )
+    gcp["region"] = region
+
+    # Every supported Agent Engine region has a '-b' zone (whereas us-east1 and
+    # europe-west1 do not have '-a'). Default to '<region>-b' if omitted.
+    zone = str(gcp.get("zone") or f"{region}-b").strip()
+    valid_zones = [f"{region}-{z}" for z in SUPPORTED_AGENT_ENGINE_REGIONS[region]]
+    if zone not in valid_zones:
+        raise SystemExit(
+            f"Error: Invalid gcp.zone '{zone}' for region '{region}'.\n"
+            f"Valid zones in '{region}': {', '.join(valid_zones)}"
+        )
+    gcp["zone"] = zone
+
+    dns_domain = str(networking.get("dns_peering_domain", "mcp.internal."))
+    if not dns_domain.endswith("."):
+        dns_domain += "."
+    networking["dns_peering_domain"] = dns_domain
+
+    return {
+        "gcp": gcp,
+        "agent": agent,
+        "mcp_server": mcp_server,
+        "networking": networking,
+    }
+
+
+def _get_access_token() -> str:
+    try:
+        creds, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        auth_req = google.auth.transport.requests.Request()
+        creds.refresh(auth_req)
+        if creds.token:
+            return creds.token
+    except Exception:
+        pass
+
+    res = subprocess.run(
+        ["gcloud", "auth", "print-access-token"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode == 0 and res.stdout.strip():
+        return res.stdout.strip()
+    raise SystemExit(
+        "Error: Unable to obtain Google Cloud access token. "
+        "Run 'gcloud auth application-default login' or 'gcloud auth login'."
+    )
+
+
+def _get_active_principal() -> str:
+    res = subprocess.run(
+        ["gcloud", "config", "get-value", "account"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode == 0 and res.stdout.strip():
+        return res.stdout.strip()
+    return "<your-gcp-user-or-service-account-email>"
+
+
+def _check_vertex_model_availability(
+    project_id: str, model_name: str, location: str = "global"
+) -> tuple[bool, str]:
+    """Verify that `model_name` exists and is accessible in Vertex AI."""
+    try:
+        client = genai.Client(
+            vertexai=True, project=project_id, location=location
+        )
+        info = client.models.get(model=model_name)
+        client.models.count_tokens(model=model_name, contents="ping")
+        resolved_name = getattr(info, "name", None) or f"publishers/google/models/{model_name}"
+        return True, str(resolved_name)
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _discover_available_vertex_models(
+    project_id: str, location: str = "global"
+) -> list[str]:
+    """Probe known Vertex AI Gemini models and return those available in `project_id`."""
+    available: list[str] = []
+    try:
+        client = genai.Client(
+            vertexai=True, project=project_id, location=location
+        )
+        for candidate in CANDIDATE_VERTEX_GEMINI_MODELS:
+            try:
+                client.models.get(model=candidate)
+                available.append(candidate)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return available
+
+
+def _print_admin_request_and_exit(
+    *,
+    project_id: str,
+    principal: str,
+    missing_roles: list[str],
+    missing_apis: list[str],
+    missing_sa_bindings: list[tuple[str, str]],
+    org_policy_notes: list[str],
+    failure_detail: str | None = None,
+) -> None:
+    print("\n" + "!" * 78)
+    print("  INSUFFICIENT PERMISSIONS TO UPDATE GCP PROJECT CONFIGURATION")
+    print("!" * 78)
+    if failure_detail:
+        print(f"\n  Reason: {failure_detail}\n")
+
+    member_type = (
+        "serviceAccount"
+        if principal.endswith(".gserviceaccount.com")
+        else "user"
+    )
+
+    print("  Please send the following request to your GCP Project Administrator:\n")
+    print("  " + "-" * 74)
+    print(
+        f"  Hello GCP Project Administrator,\n\n"
+        f"  I am deploying a Vertex AI Agent Engine with a static outbound IP (via\n"
+        f"  Private Service Connect Network Attachment, Egress Proxy VM, and Cloud NAT)\n"
+        f"  in project '{project_id}', and my account ({principal}) lacks the\n"
+        f"  permissions required to complete the project setup."
+    )
+
+    if missing_roles:
+        roles_str = ", ".join(sorted(set(missing_roles)))
+        print(
+            f"\n  1. Please grant my principal ({member_type}:{principal}) the following\n"
+            f"     IAM roles on project '{project_id}':\n"
+            f"       {roles_str}\n"
+        )
+        for r in sorted(set(missing_roles)):
+            print(
+                f"     gcloud projects add-iam-policy-binding {project_id} \\\n"
+                f"       --member=\"{member_type}:{principal}\" --role=\"{r}\""
+            )
+
+    if missing_apis:
+        apis_str = " ".join(sorted(set(missing_apis)))
+        print(
+            f"\n  2. Please enable the following required Google Cloud APIs in '{project_id}':\n"
+            f"     gcloud services enable {apis_str} --project={project_id}"
+        )
+
+    if missing_sa_bindings:
+        print(
+            f"\n  3. Please ensure the Vertex AI Service Agent and Compute Engine default\n"
+            f"     service account exist and have the following project IAM bindings:"
+        )
+        print(
+            f"     gcloud beta services identity create --service=aiplatform.googleapis.com --project={project_id}"
+        )
+        for member, role in missing_sa_bindings:
+            print(
+                f"     gcloud projects add-iam-policy-binding {project_id} \\\n"
+                f"       --member=\"{member}\" --role=\"{role}\""
+            )
+
+    if org_policy_notes:
+        print("\n  4. Organization Policy / Model Access adjustments required:")
+        for note in org_policy_notes:
+            print(f"     - {note}")
+
+    print("  " + "-" * 74 + "\n")
+    raise SystemExit(1)
+
+
+def run_preflight_checks(
+    cfg: dict[str, Any],
+    *,
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    auto_confirm: bool = False,
+) -> None:
+    """Inspect caller permissions, enabled APIs, service agents, org policies, and model availability.
+
+    If any prerequisite is missing, inform the user, ask for confirmation, and
+    attempt to remediate it. If the user lacks permissions to update the project,
+    print a ready-to-send paragraph for the GCP Project Administrator and exit.
+    """
+    project_id = str(cfg["gcp"]["project_id"])
+    region = str(cfg["gcp"]["region"])
+    zone = str(cfg["gcp"]["zone"])
+    agent_model = str(cfg["agent"].get("model", "gemini-2.5-flash")).strip()
+
+    print("=" * 78)
+    print(f"  PREFLIGHT CHECK — Project '{project_id}' ({region} / {zone})")
+    print("=" * 78)
+
+    token = _get_access_token()
+    principal = _get_active_principal()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    print(f"  [1/6] Active Principal: {principal}")
+
+    # 1. CheckCaller IAM permissions via cloudresourcemanager testIamPermissions
+    print("  [2/6] Checking caller IAM permissions on project...")
+    test_perms_url = f"https://cloudresourcemanager.googleapis.com/v1/projects/{project_id}:testIamPermissions"
+    all_required_perms = list(PERMISSION_TO_ROLE.keys())
+    perm_resp = requests.post(
+        test_perms_url,
+        headers=headers,
+        json={"permissions": all_required_perms},
+        timeout=20,
+    )
+    if not perm_resp.ok:
+        _print_admin_request_and_exit(
+            project_id=project_id,
+            principal=principal,
+            missing_roles=sorted(set(PERMISSION_TO_ROLE.values())),
+            missing_apis=REQUIRED_APIS,
+            missing_sa_bindings=[],
+            org_policy_notes=[],
+            failure_detail=f"Cannot query project '{project_id}' permissions (HTTP {perm_resp.status_code}: {perm_resp.text}).",
+        )
+
+    granted_perms = set(perm_resp.json().get("permissions") or [])
+    missing_perms = sorted(set(all_required_perms) - granted_perms)
+    missing_caller_roles = sorted({PERMISSION_TO_ROLE[p] for p in missing_perms})
+    can_set_iam = "resourcemanager.projects.setIamPolicy" in granted_perms
+    can_enable_apis = "serviceusage.services.enable" in granted_perms
+
+    if missing_perms and not can_set_iam:
+        _print_admin_request_and_exit(
+            project_id=project_id,
+            principal=principal,
+            missing_roles=missing_caller_roles,
+            missing_apis=[],
+            missing_sa_bindings=[],
+            org_policy_notes=[],
+            failure_detail=(
+                f"Caller is missing required project permissions ({', '.join(missing_perms)}) "
+                "and does not have 'resourcemanager.projects.setIamPolicy' to self-grant them."
+            ),
+        )
+    elif not missing_perms:
+        print("        ✓ Caller has all 21 required project IAM permissions.")
+    else:
+        print(f"        ! Caller is missing permissions: {', '.join(missing_perms)}")
+
+    # Fetch project number
+    proj_resp = requests.get(
+        f"https://cloudresourcemanager.googleapis.com/v1/projects/{project_id}",
+        headers=headers,
+        timeout=20,
+    )
+    if not proj_resp.ok:
+        _print_admin_request_and_exit(
+            project_id=project_id,
+            principal=principal,
+            missing_roles=["roles/viewer"] + missing_caller_roles,
+            missing_apis=["cloudresourcemanager.googleapis.com"],
+            missing_sa_bindings=[],
+            org_policy_notes=[],
+            failure_detail=f"Unable to read project metadata for '{project_id}' (HTTP {proj_resp.status_code}).",
+        )
+    project_number = str(proj_resp.json().get("projectNumber", ""))
+
+    # 2. Check Enabled APIs
+    print("  [3/6] Checking required Google Cloud APIs...")
+    enabled_apis: set[str] = set()
+    svc_res = subprocess.run(
+        [
+            "gcloud",
+            "services",
+            "list",
+            "--enabled",
+            f"--project={project_id}",
+            "--format=value(config.name)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if svc_res.returncode == 0:
+        enabled_apis = {line.strip() for line in svc_res.stdout.splitlines() if line.strip()}
+    missing_apis = [api for api in REQUIRED_APIS if api not in enabled_apis]
+
+    if not missing_apis:
+        print(f"        ✓ All {len(REQUIRED_APIS)} required GCP APIs are enabled.")
+    else:
+        print(f"        ! Missing enabled APIs ({len(missing_apis)}): {', '.join(missing_apis)}")
+        if not can_enable_apis:
+            _print_admin_request_and_exit(
+                project_id=project_id,
+                principal=principal,
+                missing_roles=["roles/serviceusage.serviceUsageAdmin"] + missing_caller_roles,
+                missing_apis=missing_apis,
+                missing_sa_bindings=[],
+                org_policy_notes=[],
+                failure_detail="Required GCP APIs are disabled and caller lacks 'serviceusage.services.enable'.",
+            )
+
+    # 3. Check Vertex AI Service Agent & Compute Default SA IAM bindings
+    print("  [4/6] Checking Vertex AI Service Agent and project IAM bindings...")
+    vertex_sa_email = f"service-{project_number}@gcp-sa-aiplatform.iam.gserviceaccount.com"
+    vertex_sa_member = f"serviceAccount:{vertex_sa_email}"
+    compute_sa_member = f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"
+
+    required_sa_bindings = [
+        (vertex_sa_member, "roles/compute.networkAdmin"),
+        (vertex_sa_member, "roles/dns.peer"),
+        (vertex_sa_member, "roles/aiplatform.user"),
+        (compute_sa_member, "roles/cloudbuild.builds.builder"),
+    ]
+    missing_sa_bindings: list[tuple[str, str]] = []
+
+    iam_resp = requests.post(
+        f"https://cloudresourcemanager.googleapis.com/v1/projects/{project_id}:getIamPolicy",
+        headers=headers,
+        json={},
+        timeout=20,
+    )
+    if iam_resp.ok:
+        bindings = iam_resp.json().get("bindings") or []
+        role_to_members: dict[str, set[str]] = {}
+        for b in bindings:
+            role_to_members.setdefault(b.get("role", ""), set()).update(b.get("members") or [])
+        for member, role in required_sa_bindings:
+            if member not in role_to_members.get(role, set()):
+                missing_sa_bindings.append((member, role))
+
+    if not missing_sa_bindings:
+        print("        ✓ Vertex AI Service Agent and Compute SA IAM bindings are configured.")
+    else:
+        for member, role in missing_sa_bindings:
+            print(f"        ! Missing IAM binding: {member} -> {role}")
+        if not can_set_iam:
+            _print_admin_request_and_exit(
+                project_id=project_id,
+                principal=principal,
+                missing_roles=["roles/resourcemanager.projectIamAdmin"] + missing_caller_roles,
+                missing_apis=missing_apis,
+                missing_sa_bindings=missing_sa_bindings,
+                org_policy_notes=[],
+                failure_detail="Project service agent IAM bindings are missing and caller lacks 'resourcemanager.projects.setIamPolicy'.",
+            )
+
+    # 4. Check Organization Policy Constraints
+    print("  [5/6] Checking effective Organization Policy constraints...")
+    org_policy_notes: list[str] = []
+    network_tf_path = TERRAFORM_DIR / "network.tf"
+    need_disable_ip_forward_in_tf = False
+
+    # Check compute.vmCanIpForward vs network.tf
+    if network_tf_path.exists():
+        net_tf_text = network_tf_path.read_text(encoding="utf-8")
+        if "can_ip_forward            = true" in net_tf_text or "can_ip_forward = true" in net_tf_text:
+            pol_res = subprocess.run(
+                [
+                    "gcloud",
+                    "resource-manager",
+                    "org-policies",
+                    "describe",
+                    "compute.vmCanIpForward",
+                    f"--project={project_id}",
+                    "--effective",
+                    "--format=json",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if pol_res.returncode == 0 and pol_res.stdout.strip():
+                try:
+                    pol_data = json.loads(pol_res.stdout)
+                    if (pol_data.get("listPolicy") or {}).get("allValues") == "DENY":
+                        need_disable_ip_forward_in_tf = True
+                        print(
+                            "        ! Org Policy 'constraints/compute.vmCanIpForward' is DENY, "
+                            "and network.tf has can_ip_forward = true."
+                        )
+                except Exception:
+                    pass
+
+    # Check gcp.resourceLocations
+    loc_res = subprocess.run(
+        [
+            "gcloud",
+            "resource-manager",
+            "org-policies",
+            "describe",
+            "gcp.resourceLocations",
+            f"--project={project_id}",
+            "--effective",
+            "--format=json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if loc_res.returncode == 0 and loc_res.stdout.strip():
+        try:
+            loc_data = json.loads(loc_res.stdout)
+            list_pol = loc_data.get("listPolicy") or {}
+            allowed_vals = list_pol.get("allowedValues") or []
+            if allowed_vals and not any(
+                region in v or f"in:{region}" in v or "in:us-locations" in v and region.startswith("us-")
+                for v in allowed_vals
+            ):
+                org_policy_notes.append(
+                    f"Constraint 'constraints/gcp.resourceLocations' restricts allowed regions to {allowed_vals}, "
+                    f"which may block deployment in '{region}'."
+                )
+        except Exception:
+            pass
+
+    if org_policy_notes:
+        _print_admin_request_and_exit(
+            project_id=project_id,
+            principal=principal,
+            missing_roles=missing_caller_roles,
+            missing_apis=missing_apis,
+            missing_sa_bindings=missing_sa_bindings,
+            org_policy_notes=org_policy_notes,
+            failure_detail="An active Organization Policy constraint blocks deployment in the configured region.",
+        )
+    elif not need_disable_ip_forward_in_tf:
+        print("        ✓ Organization Policy constraints verified (Shielded VM, no external VM IP, no IP forwarding required).")
+
+    # 5. Check Vertex AI Gemini Model Availability
+    print(f"  [6/6] Checking Vertex AI Gemini model availability ('{agent_model}' in 'global')...")
+    replacement_model: str | None = None
+    if "aiplatform.googleapis.com" in missing_apis:
+        print("        ! Deferring model availability check until 'aiplatform.googleapis.com' is enabled.")
+    else:
+        model_ok, model_detail = _check_vertex_model_availability(
+            project_id, agent_model, location="global"
+        )
+        if model_ok:
+            print(
+                f"        ✓ Model '{model_detail}' is available and accessible in Vertex AI ('global')."
+            )
+        else:
+            available_models = _discover_available_vertex_models(
+                project_id, location="global"
+            )
+            if available_models:
+                replacement_model = available_models[0]
+                print(
+                    f"        ! Model '{agent_model}' is not available in Vertex AI ('global'): {model_detail.splitlines()[0][:140]}"
+                )
+                print(
+                    f"        ! Available Vertex AI Gemini models in project '{project_id}': {', '.join(available_models)}"
+                )
+            elif "403" in model_detail or "PERMISSION_DENIED" in model_detail:
+                if not can_set_iam:
+                    _print_admin_request_and_exit(
+                        project_id=project_id,
+                        principal=principal,
+                        missing_roles=["roles/aiplatform.user"] + missing_caller_roles,
+                        missing_apis=missing_apis,
+                        missing_sa_bindings=missing_sa_bindings,
+                        org_policy_notes=[
+                            f"Ensure Vertex AI Publisher Model access is enabled for Gemini models (e.g., 'gemini-2.5-flash') in project '{project_id}'."
+                        ],
+                        failure_detail=f"Permission denied accessing Vertex AI model '{agent_model}': {model_detail}",
+                    )
+                else:
+                    if "roles/aiplatform.user" not in missing_caller_roles:
+                        missing_caller_roles.append("roles/aiplatform.user")
+            else:
+                _print_admin_request_and_exit(
+                    project_id=project_id,
+                    principal=principal,
+                    missing_roles=missing_caller_roles,
+                    missing_apis=missing_apis,
+                    missing_sa_bindings=missing_sa_bindings,
+                    org_policy_notes=[
+                        f"Publisher model '{agent_model}' (and standard Gemini 2.5/3 models) could not be accessed in project '{project_id}' (location 'global'). Please verify Vertex AI Model Garden access for Google Publisher models."
+                    ],
+                    failure_detail=f"Model '{agent_model}' is unavailable in project '{project_id}': {model_detail}",
+                )
+
+    # Check if any remediation is needed
+    needs_remediation = bool(
+        missing_caller_roles
+        or missing_apis
+        or missing_sa_bindings
+        or need_disable_ip_forward_in_tf
+        or replacement_model
+    )
+
+    if not needs_remediation:
+        print("=" * 78)
+        print("  ✓ All preflight checks passed! Ready to deploy.")
+        print("=" * 78 + "\n")
+        return
+
+    print("\n" + "-" * 78)
+    print("  MISSING CONFIGURATION DETECTED — REMEDIATION PLAN")
+    print("-" * 78)
+    if missing_caller_roles:
+        print(f"  • Grant caller ({principal}) IAM roles: {', '.join(missing_caller_roles)}")
+    if missing_apis:
+        print(f"  • Enable GCP APIs: {', '.join(missing_apis)}")
+    if missing_sa_bindings:
+        print("  • Provision Vertex AI Service Agent identity (if not created yet) and grant IAM bindings:")
+        for member, role in missing_sa_bindings:
+            print(f"      - {member} -> {role}")
+    if need_disable_ip_forward_in_tf:
+        print(
+            "  • Update terraform/network.tf to set 'can_ip_forward = false' on egress_proxy "
+            "(complies with 'constraints/compute.vmCanIpForward' since our Layer-7 HTTP proxy does not require L3 IP forwarding)."
+        )
+    if replacement_model:
+        print(
+            f"  • Update 'agent.model' in {config_path.name} from '{agent_model}' to '{replacement_model}' "
+            f"(verified available in Vertex AI for project '{project_id}')."
+        )
+    print("-" * 78)
+
+    if not auto_confirm:
+        if not sys.stdin.isatty():
+            print(
+                "\nNon-interactive shell detected. Re-run with '--yes' ('-y') to automatically "
+                "apply these configuration updates, or run interactively to confirm."
+            )
+            raise SystemExit(1)
+        answer = input(
+            "\nWould you like manage-static-agent to apply these configuration updates now? [y/N]: "
+        ).strip().lower()
+        if answer not in ("y", "yes"):
+            print("Aborted by user.")
+            raise SystemExit(1)
+
+    print("\n==> Applying required GCP project configuration updates...")
+    member_type = (
+        "serviceAccount"
+        if principal.endswith(".gserviceaccount.com")
+        else "user"
+    )
+
+    # 1. Self-grant missing caller roles if any
+    for role in missing_caller_roles:
+        print(f"    • Granting {role} to {member_type}:{principal}...")
+        res = subprocess.run(
+            [
+                "gcloud",
+                "projects",
+                "add-iam-policy-binding",
+                project_id,
+                f"--member={member_type}:{principal}",
+                f"--role={role}",
+                "--quiet",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            _print_admin_request_and_exit(
+                project_id=project_id,
+                principal=principal,
+                missing_roles=missing_caller_roles,
+                missing_apis=missing_apis,
+                missing_sa_bindings=missing_sa_bindings,
+                org_policy_notes=org_policy_notes,
+                failure_detail=f"Failed to grant role '{role}': {res.stderr.strip()}",
+            )
+
+    # 2. Enable missing APIs
+    if missing_apis:
+        print(f"    • Enabling GCP APIs: {', '.join(missing_apis)}...")
+        res = subprocess.run(
+            [
+                "gcloud",
+                "services",
+                "enable",
+                *missing_apis,
+                f"--project={project_id}",
+                "--quiet",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            _print_admin_request_and_exit(
+                project_id=project_id,
+                principal=principal,
+                missing_roles=missing_caller_roles,
+                missing_apis=missing_apis,
+                missing_sa_bindings=missing_sa_bindings,
+                org_policy_notes=org_policy_notes,
+                failure_detail=f"Failed to enable required APIs: {res.stderr.strip()}",
+            )
+
+    # 3. Provision Vertex AI Service Agent and apply missing SA IAM bindings
+    if missing_sa_bindings:
+        print("    • Ensuring Vertex AI Service Agent identity exists...")
+        subprocess.run(
+            [
+                "gcloud",
+                "beta",
+                "services",
+                "identity",
+                "create",
+                "--service=aiplatform.googleapis.com",
+                f"--project={project_id}",
+                "--quiet",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for member, role in missing_sa_bindings:
+            print(f"    • Granting {role} to {member}...")
+            res = subprocess.run(
+                [
+                    "gcloud",
+                    "projects",
+                    "add-iam-policy-binding",
+                    project_id,
+                    f"--member={member}",
+                    f"--role={role}",
+                    "--quiet",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if res.returncode != 0:
+                _print_admin_request_and_exit(
+                    project_id=project_id,
+                    principal=principal,
+                    missing_roles=missing_caller_roles,
+                    missing_apis=[],
+                    missing_sa_bindings=missing_sa_bindings,
+                    org_policy_notes=org_policy_notes,
+                    failure_detail=f"Failed to bind '{role}' to '{member}': {res.stderr.strip()}",
+                )
+
+    # 4. Update can_ip_forward = false if needed
+    if need_disable_ip_forward_in_tf and network_tf_path.exists():
+        print("    • Updating terraform/network.tf to set can_ip_forward = false...")
+        updated = (
+            network_tf_path.read_text(encoding="utf-8")
+            .replace("can_ip_forward            = true", "can_ip_forward            = false")
+            .replace("can_ip_forward = true", "can_ip_forward = false")
+        )
+        network_tf_path.write_text(updated, encoding="utf-8")
+
+    # 5. Update agent.model in config.yaml if replacement_model was selected
+    if replacement_model:
+        print(f"    • Updating 'agent.model' in {config_path} to '{replacement_model}'...")
+        cfg["agent"]["model"] = replacement_model
+        if config_path.exists():
+            raw_cfg_text = config_path.read_text(encoding="utf-8")
+            updated_cfg_text = raw_cfg_text.replace(
+                f'model: "{agent_model}"', f'model: "{replacement_model}"'
+            ).replace(
+                f"model: '{agent_model}'", f"model: '{replacement_model}'"
+            ).replace(
+                f"model: {agent_model}", f'model: "{replacement_model}"'
+            )
+            config_path.write_text(updated_cfg_text, encoding="utf-8")
+
+    # If aiplatform.googleapis.com was just enabled, verify model availability now
+    if "aiplatform.googleapis.com" in missing_apis:
+        current_model = str(cfg["agent"].get("model", "gemini-2.5-flash")).strip()
+        model_ok, model_detail = _check_vertex_model_availability(
+            project_id, current_model, location="global"
+        )
+        if not model_ok:
+            available_models = _discover_available_vertex_models(project_id, location="global")
+            if available_models:
+                new_model = available_models[0]
+                print(
+                    f"    • Model '{current_model}' not found; updating 'agent.model' to available model '{new_model}'..."
+                )
+                cfg["agent"]["model"] = new_model
+                if config_path.exists():
+                    raw_cfg_text = config_path.read_text(encoding="utf-8")
+                    config_path.write_text(
+                        raw_cfg_text.replace(current_model, new_model),
+                        encoding="utf-8",
+                    )
+
+    print("==> ✓ All required GCP project settings were successfully updated! Continuing...\n")
+
+
+def _is_excluded_file(rel_posix: str, name: str) -> bool:
+    for pat in _EXCLUDED_FILE_PATTERNS:
+        if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(rel_posix, pat):
+            return True
+    return False
+
+
+def _packaged_files(root: Path) -> list[str]:
+    files: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = Path(dirpath).relative_to(root)
+        dirnames[:] = sorted(
+            d
+            for d in dirnames
+            if d not in _EXCLUDED_DIRS
+            and (rel_dir / d).as_posix() != "deployment/terraform"
+        )
+        for name in sorted(filenames):
+            rel = (rel_dir / name).as_posix()
+            if not _is_excluded_file(rel, name):
+                files.append(rel)
+    return sorted(files)
+
+
+def _ensure_clean_uv_lock(agent_dir: Path) -> None:
+    """Ensure uv.lock does not contain internal Google Airlock proxy URLs."""
+    uv_lock = agent_dir / "uv.lock"
+    if uv_lock.exists():
+        content = uv_lock.read_text(encoding="utf-8", errors="ignore")
+        if "airlock-proxy.uplink.goog" in content:
+            print("Regenerating uv.lock with --no-config to remove internal proxy URLs...")
+            uv_lock.unlink()
+            subprocess.run(
+                ["uv", "lock", "--no-config"],
+                cwd=str(agent_dir),
+                check=True,
+            )
+
+
+def _package_agent_source(cfg: dict[str, Any]) -> Path:
+    """Create a deterministic .tar.gz archive of the agent source directory."""
+    source_rel = cfg["agent"].get("source_dir", "./hello-mcp-agent")
+    agent_dir = (SCRIPT_DIR / source_rel).resolve()
+    if not agent_dir.exists():
+        raise SystemExit(f"Error: Agent source directory not found: {agent_dir}")
+    if not (agent_dir / "Dockerfile").exists():
+        raise SystemExit(f"Error: Dockerfile not found in {agent_dir}")
+
+    _ensure_clean_uv_lock(agent_dir)
+
+    files = _packaged_files(agent_dir)
+    if "Dockerfile" not in files:
+        raise SystemExit("Error: Dockerfile is excluded by ignore rules.")
+
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    raw_buf = io.BytesIO()
+    with gzip.GzipFile(filename="agent_source.tar", mode="wb", fileobj=raw_buf, mtime=0) as gz:
+        with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            for rel_path in files:
+                full_path = agent_dir / rel_path
+                arcname = f"./{rel_path}"
+                info = tar.gettarinfo(str(full_path), arcname=arcname)
+                info.mtime = 0
+                info.uid = 0
+                info.gid = 0
+                info.uname = "root"
+                info.gname = "root"
+                if info.isfile():
+                    with open(full_path, "rb") as rf:
+                        tar.addfile(info, rf)
+                else:
+                    tar.addfile(info)
+
+    ARCHIVE_PATH.write_bytes(raw_buf.getvalue())
+    return ARCHIVE_PATH
+
+
+def _write_tfvars(cfg: dict[str, Any], archive_path: Path) -> Path:
+    gcp = cfg["gcp"]
+    agent = cfg["agent"]
+    mcp = cfg["mcp_server"]
+    net = cfg["networking"]
+
+    tfvars = {
+        "project_id": str(gcp["project_id"]),
+        "region": str(gcp.get("region", "us-east1")),
+        "zone": str(gcp.get("zone", f"{gcp.get('region', 'us-east1')}-b")),
+        "agent_name": str(agent.get("name", "hello-mcp-agent")),
+        "agent_description": str(
+            agent.get(
+                "description",
+                "Hello World MCP Agent on Vertex AI Agent Engine with static egress IP",
+            )
+        ),
+        "agent_model": str(agent.get("model", "gemini-2.5-flash")),
+        "source_archive_path": str(archive_path.resolve()),
+        "min_instances": int(agent.get("min_instances", 1)),
+        "max_instances": int(agent.get("max_instances", 10)),
+        "cpu": str(agent.get("cpu", "4")),
+        "memory": str(agent.get("memory", "8Gi")),
+        "container_concurrency": int(agent.get("concurrency", 9)),
+        "mcp_server_url": str(mcp["url"]),
+        "mcp_transport": str(mcp.get("transport", "streamable-http")),
+        "resource_prefix": str(net.get("resource_prefix", "hello-mcp-static")),
+        "psc_subnet_cidr": str(net.get("psc_subnet_cidr", "192.168.10.0/28")),
+        "proxy_subnet_cidr": str(net.get("proxy_subnet_cidr", "10.10.10.0/28")),
+        "proxy_internal_ip": str(net.get("proxy_internal_ip", "10.10.10.2")),
+        "proxy_port": int(net.get("proxy_port", 8888)),
+        "proxy_machine_type": str(net.get("proxy_machine_type", "e2-micro")),
+        "dns_peering_domain": str(net.get("dns_peering_domain", "mcp.internal.")),
+    }
+
+    TFVARS_PATH.write_text(json.dumps(tfvars, indent=2) + "\n", encoding="utf-8")
+    return TFVARS_PATH
+
+
+def _ensure_terraform_init(tf_bin: str) -> None:
+    dot_tf = TERRAFORM_DIR / ".terraform"
+    if not dot_tf.exists():
+        print("==> Initializing Terraform...")
+        subprocess.run(
+            [tf_bin, f"-chdir={TERRAFORM_DIR}", "init"],
+            check=True,
+        )
+
+
+def _get_terraform_outputs(tf_bin: str) -> dict[str, Any]:
+    state_file = TERRAFORM_DIR / "terraform.tfstate"
+    if not state_file.exists():
+        return {}
+    res = subprocess.run(
+        [tf_bin, f"-chdir={TERRAFORM_DIR}", "output", "-json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+        return {}
+    try:
+        raw = json.loads(res.stdout)
+        return {k: v.get("value") for k, v in raw.items()}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _update_deployment_metadata(resource_name: str | None) -> None:
+    if not METADATA_PATH.parent.exists():
+        return
+    if resource_name:
+        payload = {
+            "remote_agent_runtime_id": resource_name,
+            "deployment_target": "agent_runtime",
+            "is_a2a": True,
+            "agent_directory": "app",
+            "deployment_timestamp": datetime.datetime.now(tz=datetime.UTC).isoformat(),
+        }
+    else:
+        payload = {
+            "remote_agent_runtime_id": "None",
+            "deployment_timestamp": "None",
+        }
+    METADATA_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _fetch_live_engine_info(base_endpoint: str) -> dict[str, Any] | None:
+    try:
+        token = _get_access_token()
+        resp = requests.get(
+            base_endpoint,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        if resp.ok:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+
+def cmd_preflight(args: argparse.Namespace) -> None:
+    config_path = Path(args.config).resolve()
+    cfg = _load_config(config_path)
+    run_preflight_checks(cfg, config_path=config_path, auto_confirm=args.yes)
+
+
+def cmd_deploy(args: argparse.Namespace) -> None:
+    config_path = Path(args.config).resolve()
+    cfg = _load_config(config_path)
+    tf_bin = _find_terraform_bin()
+
+    if not args.skip_preflight:
+        run_preflight_checks(cfg, config_path=config_path, auto_confirm=args.yes)
+
+    print(f"==> Loading configuration from {config_path}")
+    print(f"    GCP Project:       {cfg['gcp']['project_id']}")
+    print(f"    Region / Zone:     {cfg['gcp'].get('region', 'us-east1')} / {cfg['gcp'].get('zone', 'us-east1-b')}")
+    print(f"    Agent Name:        {cfg['agent'].get('name', 'hello-mcp-agent')}")
+    print(f"    Agent Model:       {cfg['agent'].get('model', 'gemini-2.5-flash')}")
+    print(f"    Remote MCP Server: {cfg['mcp_server']['url']} ({cfg['mcp_server'].get('transport', 'streamable-http')})")
+
+    print("==> Packaging ADK agent source archive...")
+    archive_path = _package_agent_source(cfg)
+    size_kb = archive_path.stat().st_size / 1024.0
+    print(f"    Archive ready:     {archive_path} ({size_kb:.1f} KB)")
+
+    tfvars_path = _write_tfvars(cfg, archive_path)
+    print(f"    Terraform vars:    {tfvars_path}")
+
+    _ensure_terraform_init(tf_bin)
+
+    if args.plan_only:
+        print("==> Running Terraform plan (--plan-only)...")
+        subprocess.run(
+            [
+                tf_bin,
+                f"-chdir={TERRAFORM_DIR}",
+                "plan",
+                f"-var-file={tfvars_path.name}",
+            ],
+            check=True,
+        )
+        return
+
+    print("==> Applying Terraform deployment (Agent Engine + Static IP Egress Infrastructure)...")
+    apply_cmd = [
+        tf_bin,
+        f"-chdir={TERRAFORM_DIR}",
+        "apply",
+        f"-var-file={tfvars_path.name}",
+    ]
+    if not args.interactive:
+        apply_cmd.append("-auto-approve")
+
+    subprocess.run(apply_cmd, check=True)
+
+    outputs = _get_terraform_outputs(tf_bin)
+    resource_name = outputs.get("agent_engine_resource_name")
+    if resource_name:
+        _update_deployment_metadata(resource_name)
+
+    print("\n==> Deployment complete!")
+    _print_description(cfg, outputs, as_json=False)
+
+
+def _print_description(
+    cfg: dict[str, Any], outputs: dict[str, Any], *, as_json: bool = False
+) -> None:
+    deployed = bool(outputs.get("agent_engine_resource_name") or outputs.get("static_egress_ip"))
+    live_info = None
+    if deployed and outputs.get("agent_base_endpoint"):
+        live_info = _fetch_live_engine_info(outputs["agent_base_endpoint"])
+
+    if as_json:
+        payload = {
+            "status": "DEPLOYED" if deployed else "NOT_DEPLOYED",
+            "config": cfg,
+            "terraform_outputs": outputs,
+            "live_reasoning_engine": live_info,
+        }
+        print(json.dumps(payload, indent=2))
+        return
+
+    gcp = cfg["gcp"]
+    agent = cfg["agent"]
+    mcp = cfg["mcp_server"]
+    net = cfg["networking"]
+
+    print("=" * 78)
+    print("  STATIC-IP AGENT ENGINE DEPLOYMENT SUMMARY")
+    print("=" * 78)
+    print(f"  Status:                  {'DEPLOYED' if deployed else 'NOT DEPLOYED (showing configured values)'}")
+    print(f"  GCP Project / Region:    {gcp['project_id']} / {gcp.get('region', 'us-east1')} (zone: {gcp.get('zone', 'us-east1-b')})")
+    print()
+    print("  [Static Outbound IP for MCP Server]")
+    print(f"  Static Egress IP:        {outputs.get('static_egress_ip', '<allocated on deploy>')}")
+    print(f"  Static IP Resource:      {outputs.get('static_egress_ip_name', net.get('resource_prefix', 'hello-mcp-static') + '-static-ip')}")
+    print()
+    default_proxy_url = f"http://{net.get('proxy_internal_ip', '10.10.10.2')}:{net.get('proxy_port', 8888)}"
+    print("  [Remote MCP Server]")
+    print(f"  MCP Endpoint URL:        {outputs.get('mcp_server_url', mcp['url'])}")
+    print(f"  MCP Transport:           {outputs.get('mcp_transport', mcp.get('transport', 'streamable-http'))}")
+    print(f"  Internal VPC Proxy URL:  {outputs.get('mcp_proxy_url', default_proxy_url)}")
+    print()
+    print("  [Vertex AI Agent Engine]")
+    print(f"  Agent Display Name:      {agent.get('name', 'hello-mcp-agent')}")
+    print(f"  Model:                   {agent.get('model', 'gemini-2.5-flash')}")
+    print(f"  Engine ID:               {outputs.get('agent_engine_id', '<not deployed>')}")
+    print(f"  Resource Name:           {outputs.get('agent_engine_resource_name', '<not deployed>')}")
+    print(f"  StreamQuery Endpoint:    {outputs.get('agent_stream_query_endpoint', '<not deployed>')}")
+    print(f"  Query Endpoint:          {outputs.get('agent_query_endpoint', '<not deployed>')}")
+    print(f"  A2A Agent Card URL:      {outputs.get('agent_a2a_card_url', '<not deployed>')}")
+    print(f"  Cloud Console URL:       {outputs.get('agent_console_url', '<not deployed>')}")
+    if live_info:
+        print(f"  Live Update Timestamp:   {live_info.get('updateTime', 'unknown')}")
+    print()
+    print("  [GCP Networking & Infrastructure Components]")
+    print(f"  Consumer VPC Network:    {outputs.get('vpc_network_name', net.get('resource_prefix', 'hello-mcp-static') + '-vpc')}")
+    print(f"  PSC Network Attachment:  {outputs.get('psc_network_attachment_id', '<not deployed>')}")
+    print(f"  PSC Subnet:              {outputs.get('psc_subnet_name', net.get('resource_prefix', 'hello-mcp-static') + '-psc-subnet')} ({outputs.get('psc_subnet_cidr', net.get('psc_subnet_cidr', '192.168.10.0/28'))})")
+    print(f"  Egress Proxy VM:         {outputs.get('egress_proxy_vm_name', net.get('resource_prefix', 'hello-mcp-static') + '-egress-proxy')} (internal IP: {outputs.get('egress_proxy_internal_ip', net.get('proxy_internal_ip', '10.10.10.2'))})")
+    print(f"  Egress Proxy Subnet:     {outputs.get('proxy_subnet_name', net.get('resource_prefix', 'hello-mcp-static') + '-proxy-subnet')} ({outputs.get('proxy_subnet_cidr', net.get('proxy_subnet_cidr', '10.10.10.0/28'))})")
+    print(f"  Cloud Router / NAT:      {outputs.get('cloud_router_name', net.get('resource_prefix', 'hello-mcp-static') + '-router')} / {outputs.get('cloud_nat_name', net.get('resource_prefix', 'hello-mcp-static') + '-nat')}")
+    print(f"  Private DNS Zone / Host: {outputs.get('private_dns_zone_name', net.get('resource_prefix', 'hello-mcp-static') + '-private-zone')} ({outputs.get('proxy_dns_name', 'proxy.' + net.get('dns_peering_domain', 'mcp.internal.'))})")
+    print(f"  Service Account:         {outputs.get('service_account_email', '<not deployed>')}")
+    print(f"  Logs GCS Bucket:         {outputs.get('logs_bucket_name', '<not deployed>')}")
+    print("=" * 78)
+
+
+def cmd_describe(args: argparse.Namespace) -> None:
+    config_path = Path(args.config).resolve()
+    cfg = _load_config(config_path)
+    tf_bin = _find_terraform_bin()
+    outputs = _get_terraform_outputs(tf_bin)
+    _print_description(cfg, outputs, as_json=args.json)
+
+
+def _wait_for_psc_attachment_disconnect(
+    cfg: dict[str, Any], *, timeout_sec: int = 180, poll_interval_sec: int = 5
+) -> None:
+    """Wait until Vertex AI's tenant project detaches all PSC endpoints from the NetworkAttachment."""
+    project_id = str(cfg["gcp"]["project_id"])
+    region = str(cfg["gcp"].get("region", "us-east1"))
+    prefix = str(cfg["networking"].get("resource_prefix", "hello-mcp-static"))
+    attachment_name = f"{prefix}-psc-attachment"
+
+    deadline = datetime.datetime.now(tz=datetime.UTC).timestamp() + timeout_sec
+    attempt = 0
+    while True:
+        attempt += 1
+        res = subprocess.run(
+            [
+                "gcloud",
+                "compute",
+                "network-attachments",
+                "describe",
+                attachment_name,
+                f"--region={region}",
+                f"--project={project_id}",
+                "--format=json",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            # Network attachment already deleted or does not exist
+            return
+        try:
+            data = json.loads(res.stdout) if res.stdout.strip() else {}
+        except json.JSONDecodeError:
+            return
+
+        endpoints = data.get("connectionEndpoints") or []
+        if not endpoints:
+            if attempt > 1:
+                print(f"    ✓ All PSC endpoints detached from '{attachment_name}'.")
+            return
+
+        now = datetime.datetime.now(tz=datetime.UTC).timestamp()
+        if now >= deadline:
+            print(
+                f"    ! Warning: '{attachment_name}' still reports {len(endpoints)} connected "
+                f"endpoint(s) after {timeout_sec}s; proceeding with Terraform destroy..."
+            )
+            return
+
+        if attempt == 1:
+            print(
+                f"==> Waiting for Vertex AI tenant project to detach PSC endpoint(s) from '{attachment_name}'..."
+            )
+        print(
+            f"    • {len(endpoints)} endpoint(s) still attached; re-checking in {poll_interval_sec}s..."
+        )
+        import time
+
+        time.sleep(poll_interval_sec)
+
+
+def cmd_undeploy(args: argparse.Namespace) -> None:
+    config_path = Path(args.config).resolve()
+    cfg = _load_config(config_path)
+    tf_bin = _find_terraform_bin()
+
+    # Ensure archive & tfvars exist so Terraform can evaluate variables during destroy
+    if not ARCHIVE_PATH.exists():
+        _package_agent_source(cfg)
+    tfvars_path = _write_tfvars(cfg, ARCHIVE_PATH)
+    _ensure_terraform_init(tf_bin)
+
+    # Check if google_vertex_ai_reasoning_engine.app is in state; if so, destroy it
+    # first so the Vertex AI tenant project begins detaching its PSC interface endpoint
+    # before Terraform tries to delete google_compute_network_attachment.psc_attachment.
+    state_res = subprocess.run(
+        [tf_bin, f"-chdir={TERRAFORM_DIR}", "state", "list"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    state_items = {
+        line.strip() for line in state_res.stdout.splitlines() if line.strip()
+    }
+    if "google_vertex_ai_reasoning_engine.app" in state_items and not args.interactive:
+        print("==> Step 1/2: Destroying Vertex AI Agent Engine runtime first...")
+        subprocess.run(
+            [
+                tf_bin,
+                f"-chdir={TERRAFORM_DIR}",
+                "destroy",
+                "-target=google_vertex_ai_reasoning_engine.app",
+                f"-var-file={tfvars_path.name}",
+                "-auto-approve",
+            ],
+            check=True,
+        )
+
+    # Wait for any PSC interface endpoints from the Vertex AI tenant project to finish detaching
+    _wait_for_psc_attachment_disconnect(cfg)
+
+    print("==> Destroying Static-IP GCP infrastructure via Terraform...")
+    destroy_cmd = [
+        tf_bin,
+        f"-chdir={TERRAFORM_DIR}",
+        "destroy",
+        f"-var-file={tfvars_path.name}",
+    ]
+    if not args.interactive:
+        destroy_cmd.append("-auto-approve")
+
+    for attempt in range(1, 4):
+        res = subprocess.run(destroy_cmd, check=False)
+        if res.returncode == 0:
+            break
+        if attempt < 3 and not args.interactive:
+            print(
+                f"==> Terraform destroy encountered a transient dependency delay (attempt {attempt}/3); "
+                "waiting for PSC endpoints to drain before retrying..."
+            )
+            _wait_for_psc_attachment_disconnect(cfg, timeout_sec=90)
+        else:
+            raise SystemExit(res.returncode)
+
+    _update_deployment_metadata(None)
+    print("==> Undeploy complete. All Agent Engine and static-IP networking resources removed.")
+
+
+def _resolve_base_endpoint(cfg: dict[str, Any], tf_bin: str) -> str:
+    outputs = _get_terraform_outputs(tf_bin)
+    if outputs.get("agent_base_endpoint"):
+        return str(outputs["agent_base_endpoint"])
+
+    if METADATA_PATH.exists():
+        try:
+            meta = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+            res_id = meta.get("remote_agent_runtime_id")
+            if res_id and res_id != "None":
+                region = cfg["gcp"].get("region", "us-east1")
+                return f"https://{region}-aiplatform.googleapis.com/v1/{res_id}"
+        except Exception:
+            pass
+
+    raise SystemExit(
+        "Error: Agent is not deployed yet (no Terraform outputs or deployment_metadata.json found).\n"
+        "Run './manage-static-agent deploy' first."
+    )
+
+
+def _create_remote_session(base_endpoint: str, headers: dict[str, str], user_id: str) -> str:
+    query_url = f"{base_endpoint}:query"
+    payload = {
+        "class_method": "async_create_session",
+        "input": {"user_id": user_id},
+    }
+    resp = requests.post(query_url, headers=headers, json=payload, timeout=60)
+    if not resp.ok:
+        raise SystemExit(
+            f"Error creating session on Agent Engine (HTTP {resp.status_code}):\n{resp.text}"
+        )
+    data = resp.json()
+    output = data.get("output", data)
+    session_id = output.get("id") if isinstance(output, dict) else None
+    if not session_id:
+        raise SystemExit(f"Error: Unexpected session response from Agent Engine: {data}")
+    return str(session_id)
+
+
+def cmd_send(args: argparse.Namespace) -> None:
+    config_path = Path(args.config).resolve()
+    cfg = _load_config(config_path)
+    tf_bin = _find_terraform_bin()
+
+    prompt_parts = args.prompt or []
+    prompt = " ".join(prompt_parts).strip()
+    if not prompt and not sys.stdin.isatty():
+        prompt = sys.stdin.read().strip()
+    if not prompt:
+        raise SystemExit(
+            "Error: Please provide a prompt, e.g.:\n"
+            "  ./manage-static-agent send \"Greet Raul and check what IP the MCP server sees\""
+        )
+
+    base_endpoint = _resolve_base_endpoint(cfg, tf_bin)
+    token = _get_access_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    session_id = args.session_id or _create_remote_session(
+        base_endpoint, headers, args.user_id
+    )
+    stream_url = f"{base_endpoint}:streamQuery"
+    payload = {
+        "class_method": "async_stream_query",
+        "input": {
+            "user_id": args.user_id,
+            "session_id": session_id,
+            "message": prompt,
+        },
+    }
+
+    print(f"[user]: {prompt}")
+    with requests.post(
+        stream_url, headers=headers, json=payload, stream=True, timeout=180
+    ) as resp:
+        if not resp.ok:
+            raise SystemExit(
+                f"Error querying Agent Engine (HTTP {resp.status_code}):\n{resp.text}"
+            )
+
+        printed_text = False
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if args.verbose:
+                print(f"\n[event]: {json.dumps(event, indent=2)}")
+
+            content = event.get("content") or {}
+            parts = content.get("parts") or []
+            author = event.get("author", "agent")
+            for part in parts:
+                if "functionCall" in part:
+                    fc = part["functionCall"]
+                    print(f"[{author} -> tool_call]: {fc.get('name')}({json.dumps(fc.get('args', {}))})")
+                elif "functionResponse" in part:
+                    fr = part["functionResponse"]
+                    print(f"[tool_response -> {author}]: {fr.get('name')} -> {json.dumps(fr.get('response', {}))}")
+                elif "text" in part and part["text"]:
+                    if not printed_text:
+                        print(f"[{author}]: ", end="", flush=True)
+                        printed_text = True
+                    print(part["text"], end="", flush=True)
+
+        if printed_text:
+            print()
+    print(f"[session_id]: {session_id}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="manage-static-agent",
+        description=(
+            "Deploy, describe, query, and undeploy the ADK Agent on Vertex AI Agent Engine "
+            "with a deterministic static outbound IP for remote MCP server calls."
+        ),
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="Path to config.yaml (default: ./config.yaml)",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # preflight
+    p_preflight = subparsers.add_parser(
+        "preflight",
+        help="Run preflight checks (caller permissions, enabled APIs, service agents, org policies) and remediate if needed",
+    )
+    p_preflight.add_argument(
+        "-c",
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="Path to config.yaml (default: ./config.yaml)",
+    )
+    p_preflight.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Automatically confirm applying any missing GCP project settings",
+    )
+    p_preflight.set_defaults(func=cmd_preflight)
+
+    # deploy
+    p_deploy = subparsers.add_parser(
+        "deploy",
+        help="Run preflight checks and fully deploy the agent and static-IP GCP services through Terraform",
+    )
+    p_deploy.add_argument(
+        "-c",
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="Path to config.yaml (default: ./config.yaml)",
+    )
+    p_deploy.add_argument(
+        "--plan-only",
+        "--dry-run",
+        dest="plan_only",
+        action="store_true",
+        help="Package agent and run 'terraform plan' without applying changes",
+    )
+    p_deploy.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Automatically confirm applying any missing GCP preflight settings",
+    )
+    p_deploy.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Skip preflight permission/API/org-policy checks before running Terraform",
+    )
+    p_deploy.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Prompt interactively for Terraform confirmation instead of -auto-approve",
+    )
+    p_deploy.set_defaults(func=cmd_deploy)
+
+    # describe
+    p_describe = subparsers.add_parser(
+        "describe",
+        help="Describe the deployment, static egress IP, agent endpoints, and GCP components",
+    )
+    p_describe.add_argument(
+        "-c",
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="Path to config.yaml (default: ./config.yaml)",
+    )
+    p_describe.add_argument(
+        "--json",
+        action="store_true",
+        help="Output deployment description as JSON",
+    )
+    p_describe.set_defaults(func=cmd_describe)
+
+    # undeploy
+    p_undeploy = subparsers.add_parser(
+        "undeploy",
+        help="Undeploy and clean up the agent and all static-IP GCP resources via Terraform",
+    )
+    p_undeploy.add_argument(
+        "-c",
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="Path to config.yaml (default: ./config.yaml)",
+    )
+    p_undeploy.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Prompt interactively for Terraform destroy confirmation",
+    )
+    p_undeploy.set_defaults(func=cmd_undeploy)
+
+    # send
+    p_send = subparsers.add_parser(
+        "send",
+        help="Send a user prompt to the deployed agent and show the response",
+    )
+    p_send.add_argument(
+        "prompt",
+        nargs="*",
+        help="User prompt to send to the agent",
+    )
+    p_send.add_argument(
+        "-c",
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="Path to config.yaml (default: ./config.yaml)",
+    )
+    p_send.add_argument(
+        "--session-id",
+        default=None,
+        help="Optional existing session ID to continue a conversation",
+    )
+    p_send.add_argument(
+        "--user-id",
+        default="cli-user",
+        help="User ID for the session (default: cli-user)",
+    )
+    p_send.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print raw streaming JSON events",
+    )
+    p_send.set_defaults(func=cmd_send)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

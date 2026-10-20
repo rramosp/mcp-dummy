@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+terraform/.terraform/
+terraform/.build/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/terraform.tfvars.json
+hello-mcp-agent/deployment/terraform/**/.terraform/
+hello-mcp-agent/deployment/terraform/**/*.tfstate*
