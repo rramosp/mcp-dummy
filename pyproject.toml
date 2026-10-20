@@ -1,0 +1,9 @@
+[project]
+name = "mcp-static-ip"
+version = "0.1.0"
+description = "Hello World Remote MCP Server over Streamable HTTP"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0.0",
+]
