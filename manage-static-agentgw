@@ -1075,12 +1075,12 @@ def _ensure_agent_registry_and_iam_v3(
         ],
         project_id,
     )
-    if not existing_svc:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            toolspec_path = os.path.join(tmpdir, "toolspec.json")
-            with open(toolspec_path, "w", encoding="utf-8") as f:
-                json.dump(DEFAULT_MCP_TOOLS_SPEC, f, indent=2)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        toolspec_path = os.path.join(tmpdir, "toolspec.json")
+        with open(toolspec_path, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_MCP_TOOLS_SPEC, f, indent=2)
 
+        if not existing_svc:
             run_cmd(
                 [
                     "gcloud",
@@ -1098,8 +1098,24 @@ def _ensure_agent_registry_and_iam_v3(
                     "--quiet",
                 ]
             )
-    else:
-        info(f"Agent Registry service '{d['mcp_reg_name']}' already exists.")
+        else:
+            info(f"Updating existing Agent Registry service '{d['mcp_reg_name']}' with url={mcp_url}...")
+            run_cmd(
+                [
+                    "gcloud",
+                    "agent-registry",
+                    "services",
+                    "update",
+                    d["mcp_reg_name"],
+                    f"--location={region}",
+                    f"--display-name={d['connector_display_name']}",
+                    "--description=Remote Hello World MCP server accessed via Agent Gateway static IP",
+                    f"--interfaces=protocolBinding=JSONRPC,url={mcp_url}",
+                    f"--mcp-server-spec-content={toolspec_path}",
+                    f"--project={project_id}",
+                    "--quiet",
+                ]
+            )
 
     # Wait briefly for Agent Registry to materialize the projected McpServer resource
     mcp_server_resource_name = (
