@@ -1,0 +1,1952 @@
+#!/usr/bin/env python3
+"""CLI to deploy, inspect, query, and tear down a Gemini Enterprise (geapp) Custom MCP integration with a deterministic Static Outbound IP via Agent Gateway.
+
+All GCP infrastructure is provisioned and torn down exclusively via `gcloud` CLI
+commands (no Terraform, no Vertex AI Agent Engine, and no Egress Proxy VM).
+
+Architecture for Static Outbound IP (Agent Gateway + Cloud NAT):
+  1. Gemini Enterprise App (`geapp`, e.g. `main-test-app_1784407513868` in `global`)
+     is configured with `defaultEgressAgentGateway` pointing to an Agent Gateway
+     in `us-central1` (or `europe-west1` for `eu` apps).
+  2. The Agent Gateway (`networkservices.googleapis.com`) uses govern-access-path
+     `AGENT_TO_ANYWHERE` and is attached to an `AgentConnectivityTemplate` with
+     `deploymentModel: CENTRALIZED` and `egressNetworkConfig.vpcEgress: ALL_TRAFFIC`.
+  3. Because `vpcEgress: ALL_TRAFFIC` is enabled on the `AgentConnectivityTemplate`,
+     ALL outbound MCP traffic from the Agent Gateway (including traffic destined
+     for public internet IPs like `35.186.182.189:8080`) is routed through the
+     PSC Network Attachment into the customer VPC's PSC subnet.
+  4. Inside the customer VPC, Cloud Router + Cloud NAT (`MANUAL_ONLY`) SNATs all
+     outbound traffic from the PSC subnet to a reserved Static External IP
+     (`gcloud compute addresses`).
+  5. Network Security (`AuthzPolicy` + IAP `AuthzExtension`) and IAM v3
+     (`AccessPolicy` + `PolicyBinding`) authorize the Gemini Enterprise
+     `default_assistant` SPIFFE identity to invoke the MCP server registered in
+      Agent Registry (`gcloud agent-registry services`).
+  6. The remote MCP server (`mcp_server.url`) always sees the reserved Static
+     External IP for every tool invocation triggered by prompts sent to `geapp`.
+
+Subcommands:
+  preflight  Validate config, gcloud auth, org constraints, APIs, and geapp state
+  deploy     Provision VPC/NAT/PSC/Agent Gateway/Authz/Registry and wire to geapp
+  describe   Inspect live status of geapp, MCP connector, Agent Gateway, and Static IP
+  undeploy   Tear down the MCP connector, Agent Gateway, Authz, and networking via gcloud
+  send       Send a prompt to the geapp assistant (:streamAssist) and print the response
+"""
+
+import os
+import sys
+
+# Re-exec into the project's virtualenv if PyYAML / requests are not in system python3.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_VENV_PYTHON = os.path.join(_SCRIPT_DIR, "hello-mcp-agent", ".venv", "bin", "python")
+if os.path.exists(_VENV_PYTHON) and os.path.realpath(sys.executable) != os.path.realpath(_VENV_PYTHON):
+    try:
+        import yaml  # noqa: F401
+        import requests  # noqa: F401
+    except ImportError:
+        os.execv(_VENV_PYTHON, [_VENV_PYTHON] + sys.argv)
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+from typing import Any
+from urllib.parse import urlparse
+
+import requests
+import yaml
+
+
+# ─── Formatting Helpers ──────────────────────────────────────────────────────
+BOLD = "\033[1m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+CYAN = "\033[96m"
+RESET = "\033[0m"
+
+
+def info(msg: str) -> None:
+    print(f"{CYAN}ℹ{RESET} {msg}")
+
+
+def success(msg: str) -> None:
+    print(f"{GREEN}✓{RESET} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"{YELLOW}⚠{RESET} {msg}")
+
+
+def error(msg: str) -> None:
+    print(f"{RED}✗{RESET} {msg}", file=sys.stderr)
+
+
+def header(title: str) -> None:
+    print(f"\n{BOLD}═══ {title} ═══{RESET}")
+
+
+# ─── Regional Alignment Constants ────────────────────────────────────────────
+# Gemini Enterprise enforces strict regional alignment between the geapp location
+# and the Agent Gateway / Cloud NAT / Agent Registry location:
+#   global -> us-central1
+#   us     -> us-central1
+#   eu     -> europe-west1
+GEAPP_LOCATION_TO_AGW_REGION: dict[str, str] = {
+    "global": "us-central1",
+    "us": "us-central1",
+    "eu": "europe-west1",
+}
+
+REQUIRED_APIS: list[str] = [
+    "compute.googleapis.com",
+    "discoveryengine.googleapis.com",
+    "networkservices.googleapis.com",
+    "networksecurity.googleapis.com",
+    "serviceextensions.googleapis.com",
+    "iap.googleapis.com",
+    "agentregistry.googleapis.com",
+    "orgpolicy.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+]
+
+SERVICE_IDENTITIES: list[str] = [
+    "discoveryengine.googleapis.com",
+    "networkservices.googleapis.com",
+    "iap.googleapis.com",
+    "agentregistry.googleapis.com",
+]
+
+# Default MCP tool specification for the remote Hello World FastMCP server
+# (`server.py`: `hello` and `hello_from_ip`). Used when registering the MCP
+# server in Agent Registry so tool discovery does not require an un-NAT'd
+# direct connection from the local workstation.
+DEFAULT_MCP_TOOLS_SPEC: dict[str, Any] = {
+    "tools": [
+        {
+            "name": "hello",
+            "description": "Say hello to someone from the remote MCP server.",
+            "isReadOnly": True,
+            "isDestructive": False,
+            "isIdempotent": True,
+            "isOpenWorld": False,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "title": "Name",
+                        "default": "World",
+                    }
+                },
+            },
+        },
+        {
+            "name": "hello_from_ip",
+            "description": (
+                "Say hello and report the incoming client IP address and "
+                "proxy headers seen by the MCP server."
+            ),
+            "isReadOnly": True,
+            "isDestructive": False,
+            "isIdempotent": True,
+            "isOpenWorld": False,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "title": "Name",
+                        "default": "World",
+                    }
+                },
+            },
+        },
+    ]
+}
+
+
+# ─── Configuration Loader & Resource Naming ──────────────────────────────────
+def load_config(config_path: str) -> dict[str, Any]:
+    if not os.path.exists(config_path):
+        error(f"Configuration file not found: {config_path}")
+        sys.exit(1)
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    gcp = cfg.setdefault("gcp", {})
+    mcp = cfg.setdefault("mcp_server", {})
+    net = cfg.setdefault("networking", {})
+    geapp = cfg.setdefault("geapp", {})
+
+    if not gcp.get("project_id"):
+        error("gcp.project_id is required in config.yaml")
+        sys.exit(1)
+    if not mcp.get("url"):
+        error("mcp_server.url is required in config.yaml")
+        sys.exit(1)
+    if not geapp.get("name"):
+        error("geapp.name is required in config.yaml")
+        sys.exit(1)
+
+    ge_location = geapp.setdefault("location", "global")
+    expected_agw_region = GEAPP_LOCATION_TO_AGW_REGION.get(ge_location, "us-central1")
+    agw_region = geapp.setdefault("gateway_region", expected_agw_region)
+
+    prefix = net.setdefault("resource_prefix", "hello-mcp-static")
+    # Use a distinct suffix `-agw` for Agent Gateway networking resources so
+    # they never collide with `manage-static-agent` resources if both exist.
+    agw_prefix = geapp.setdefault("resource_prefix", f"{prefix}-agw")
+    net.setdefault("psc_subnet_cidr", "192.168.10.0/28")
+
+    # Derive deterministic resource names (all <= 62 chars, lowercase RFC 1035).
+    geapp.setdefault("connector_id", f"{agw_prefix}-conn")
+    geapp.setdefault("connector_display_name", "Hello MCP Static (Agent Gateway)")
+    geapp.setdefault("mcp_registry_name", f"{agw_prefix}-mcp")
+
+    cfg["_derived"] = {
+        "agw_prefix": agw_prefix,
+        "agw_region": agw_region,
+        "ge_location": ge_location,
+        "vpc_name": f"{agw_prefix}-vpc",
+        "psc_subnet_name": f"{agw_prefix}-psc-subnet",
+        "router_name": f"{agw_prefix}-router",
+        "nat_name": f"{agw_prefix}-nat",
+        "nat_ip_name": f"{agw_prefix}-ip",
+        "attachment_name": f"{agw_prefix}-psc-attachment",
+        "act_name": f"{agw_prefix}-act",
+        "agw_name": f"{agw_prefix}-gateway",
+        "authz_ext_name": f"{agw_prefix}-iap-ext",
+        "authz_policy_name": f"{agw_prefix}-authz-policy",
+        "iap_policy_name": f"{agw_prefix}-iap-policy",
+        "iap_binding_name": f"{agw_prefix}-iap-binding",
+        "mcp_reg_name": geapp["mcp_registry_name"],
+        "connector_id": geapp["connector_id"],
+        "connector_display_name": geapp["connector_display_name"],
+    }
+    return cfg
+
+
+# ─── Shell & gcloud Helpers ──────────────────────────────────────────────────
+def run_cmd(
+    cmd: list[str],
+    *,
+    capture: bool = False,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    merged_env = os.environ.copy()
+    merged_env["CLOUDSDK_CORE_DISABLE_PROMPTS"] = "1"
+    if env:
+        merged_env.update(env)
+    if not capture:
+        info(f"Running: {' '.join(cmd)}")
+    return subprocess.run(
+        cmd,
+        check=check,
+        text=True,
+        capture_output=capture,
+        env=merged_env,
+    )
+
+
+def gcloud_json(args: list[str], project_id: str | None = None, check: bool = False) -> Any:
+    cmd = ["gcloud"] + args + ["--format=json", "--quiet"]
+    if project_id and not any(a.startswith("--project") for a in args):
+        cmd.append(f"--project={project_id}")
+    res = run_cmd(cmd, capture=True, check=check)
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    try:
+        return json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def gcloud_value(args: list[str], project_id: str | None = None) -> str:
+    cmd = ["gcloud"] + args + ["--quiet"]
+    if project_id and not any(a.startswith("--project") for a in args):
+        cmd.append(f"--project={project_id}")
+    res = run_cmd(cmd, capture=True, check=False)
+    if res.returncode != 0:
+        return ""
+    return res.stdout.strip()
+
+
+def get_access_token() -> str:
+    token = gcloud_value(["auth", "print-access-token"])
+    if not token:
+        error("Failed to obtain access token via `gcloud auth print-access-token`.")
+        sys.exit(1)
+    return token
+
+
+def get_project_number(project_id: str) -> str:
+    num = gcloud_value(
+        ["projects", "describe", project_id, "--format=value(projectNumber)"]
+    )
+    if not num:
+        error(f"Unable to resolve project number for project '{project_id}'.")
+        sys.exit(1)
+    return num
+
+
+def get_org_id(project_id: str) -> str:
+    res = run_cmd(
+        [
+            "gcloud",
+            "projects",
+            "get-ancestors",
+            project_id,
+            "--format=json",
+            "--quiet",
+        ],
+        capture=True,
+        check=False,
+    )
+    if res.returncode == 0 and res.stdout.strip():
+        try:
+            ancestors = json.loads(res.stdout)
+            for item in ancestors:
+                if item.get("type") == "organization":
+                    return str(item.get("id", ""))
+        except json.JSONDecodeError:
+            pass
+    return ""
+
+
+# ─── Discovery Engine (Gemini Enterprise) REST Helpers ───────────────────────
+def de_base_url(ge_location: str, api_version: str = "v1alpha") -> str:
+    if ge_location in ("global", ""):
+        host = "https://discoveryengine.googleapis.com"
+    else:
+        host = f"https://{ge_location}-discoveryengine.googleapis.com"
+    return f"{host}/{api_version}"
+
+
+def de_headers(project_id: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {get_access_token()}",
+        "Content-Type": "application/json",
+        "X-Goog-User-Project": project_id,
+    }
+
+
+def resolve_geapp_engine(
+    project_id: str, ge_location: str, geapp_name_or_id: str
+) -> dict[str, Any] | None:
+    """Resolve the Gemini Enterprise Engine by displayName, Engine ID, or full resource name."""
+    headers = de_headers(project_id)
+    base = de_base_url(ge_location, "v1alpha")
+    target = geapp_name_or_id.strip()
+
+    # 1. Try direct GET if target has no spaces (looks like an Engine ID or full resource name).
+    if " " not in target:
+        engine_id = target.split("/")[-1]
+        direct_url = (
+            f"{base}/projects/{project_id}/locations/{ge_location}"
+            f"/collections/default_collection/engines/{engine_id}"
+        )
+        resp = requests.get(direct_url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+
+    # 2. List all engines in default_collection and match by displayName, ID, or full name.
+    list_url = (
+        f"{base}/projects/{project_id}/locations/{ge_location}"
+        f"/collections/default_collection/engines"
+    )
+    resp = requests.get(list_url, headers=headers, timeout=30)
+    if resp.status_code == 200:
+        engines = resp.json().get("engines", [])
+        for eng in engines:
+            eng_name = eng.get("name", "")
+            eng_id = eng_name.split("/")[-1]
+            disp = eng.get("displayName", "")
+            if (
+                target in (eng_id, eng_name, disp)
+                or disp.lower() == target.lower()
+            ):
+                return eng
+    return None
+
+
+
+def get_data_connector(
+    project_id: str, ge_location: str, collection_id: str
+) -> dict[str, Any] | None:
+    url = (
+        f"{de_base_url(ge_location, 'v1alpha')}/projects/{project_id}"
+        f"/locations/{ge_location}/collections/{collection_id}/dataConnector"
+    )
+    resp = requests.get(url, headers=de_headers(project_id), timeout=30)
+    if resp.status_code == 200:
+        return resp.json()
+    return None
+
+
+def poll_discovery_engine_lro(
+    project_id: str, ge_location: str, op_name: str, timeout_sec: int = 300
+) -> dict[str, Any]:
+    """Poll a Discovery Engine long-running operation until completion."""
+    base = de_base_url(ge_location, "v1alpha")
+    url = f"{base}/{op_name}"
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        resp = requests.get(url, headers=de_headers(project_id), timeout=30)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Failed polling LRO {op_name}: HTTP {resp.status_code} {resp.text}"
+            )
+        data = resp.json()
+        if data.get("done"):
+            if "error" in data:
+                raise RuntimeError(
+                    f"Operation {op_name} failed: {json.dumps(data['error'])}"
+                )
+            return data
+        time.sleep(4)
+    raise TimeoutError(f"Timed out waiting for Discovery Engine LRO: {op_name}")
+
+
+# ─── Subcommand: preflight ───────────────────────────────────────────────────
+def run_preflight(cfg: dict[str, Any]) -> bool:
+    """Validate configuration, regional alignment, gcloud auth, APIs, and geapp."""
+    gcp = cfg["gcp"]
+    mcp = cfg["mcp_server"]
+    net = cfg["networking"]
+    geapp = cfg["geapp"]
+    d = cfg["_derived"]
+
+    project_id = gcp["project_id"]
+    ge_location = d["ge_location"]
+    agw_region = d["agw_region"]
+    mcp_url = mcp["url"]
+
+    header("Preflight Validation (Static IP via Agent Gateway + Gemini Enterprise)")
+    passed = 0
+    warned = 0
+    failed = 0
+
+    def ok(msg: str) -> None:
+        nonlocal passed
+        passed += 1
+        success(msg)
+
+    def warning(msg: str) -> None:
+        nonlocal warned
+        warned += 1
+        warn(msg)
+
+    def fail(msg: str) -> None:
+        nonlocal failed
+        failed += 1
+        error(msg)
+
+    # 1. Validate local CLI dependencies (`gcloud` only — no Terraform!)
+    print(f"\n{BOLD}[1/6] Local CLI & Credentials{RESET}")
+    if shutil.which("gcloud"):
+        ok(f"gcloud CLI found: {shutil.which('gcloud')}")
+    else:
+        fail("gcloud CLI not found in PATH.")
+        return False
+
+    active_account = gcloud_value(["config", "get-value", "account"])
+    if active_account:
+        ok(f"gcloud active account: {active_account}")
+    else:
+        fail("No active gcloud account (`gcloud auth login` required).")
+
+    project_number = get_project_number(project_id)
+    org_id = get_org_id(project_id)
+    ok(f"Target GCP Project: {project_id} (projectNumber={project_number}, orgId={org_id or 'N/A'})")
+
+    # 2. Validate Regional Alignment & CIDR
+    print(f"\n{BOLD}[2/6] Regional Alignment & Network Configuration{RESET}")
+    expected_region = GEAPP_LOCATION_TO_AGW_REGION.get(ge_location)
+    if not expected_region:
+        fail(
+            f"Unsupported geapp.location '{ge_location}'. Supported values: "
+            f"{', '.join(GEAPP_LOCATION_TO_AGW_REGION)}"
+        )
+    elif agw_region != expected_region:
+        fail(
+            f"Regional mismatch: geapp.location='{ge_location}' requires "
+            f"geapp.gateway_region='{expected_region}', got '{agw_region}'."
+        )
+    else:
+        ok(
+            f"Regional alignment verified: geapp.location='{ge_location}' <-> "
+            f"Agent Gateway & Cloud NAT region='{agw_region}'"
+        )
+
+    parsed_mcp = urlparse(mcp_url)
+    if parsed_mcp.scheme not in ("http", "https") or not parsed_mcp.hostname:
+        fail(f"Invalid mcp_server.url '{mcp_url}' (must be http:// or https://).")
+    elif parsed_mcp.query:
+        fail(
+            f"mcp_server.url '{mcp_url}' must not contain a query string when "
+            "Agent Gateway egress is enabled."
+        )
+    else:
+        ok(
+            f"Remote MCP endpoint syntax valid: {mcp_url} "
+            f"(host={parsed_mcp.hostname}, port={parsed_mcp.port or (443 if parsed_mcp.scheme == 'https' else 80)})"
+        )
+        if parsed_mcp.scheme != "https":
+            warning(
+                f"mcp_server.url '{mcp_url}' uses plain HTTP. Agent Gateway (Secure Web Proxy) "
+                f"requires HTTPS with a publicly trusted TLS certificate on a domain name "
+                f"(e.g., https://mcp.{parsed_mcp.hostname}.sslip.io/mcp) or requests will match "
+                "'default_denied' (HTTP 404) at the gateway."
+            )
+
+    psc_cidr = net.get("psc_subnet_cidr", "192.168.10.0/28")
+    try:
+        prefix_len = int(psc_cidr.split("/")[1])
+        if prefix_len <= 28:
+            ok(f"PSC subnet CIDR '{psc_cidr}' (/<=28) is valid for Network Attachment.")
+        else:
+            fail(f"PSC subnet CIDR '{psc_cidr}' is too small (must be /28 or larger).")
+    except (IndexError, ValueError):
+        fail(f"Invalid PSC subnet CIDR '{psc_cidr}'.")
+
+    # 3. Check Required GCP APIs
+    print(f"\n{BOLD}[3/6] Required GCP Service APIs{RESET}")
+    enabled_services_raw = gcloud_value(
+        ["services", "list", "--enabled", "--format=value(config.name)"],
+        project_id=project_id,
+    )
+    enabled_services = set(enabled_services_raw.splitlines())
+    missing_apis = [api for api in REQUIRED_APIS if api not in enabled_services]
+    if not missing_apis:
+        ok(f"All {len(REQUIRED_APIS)} required GCP APIs are enabled.")
+    else:
+        warning(
+            f"{len(missing_apis)} API(s) not yet enabled (will be enabled during `deploy`): "
+            f"{', '.join(missing_apis)}"
+        )
+
+    # 4. Check Organization Policies
+    print(f"\n{BOLD}[4/6] Organization Policy Constraints{RESET}")
+    for constraint in (
+        "iam.managed.disableAccessPolicyBinding",
+        "discoveryengine.SkipCustomMcpRestriction",
+        "discoveryengine.managed.disableCustomMcpServerConnector",
+        "discoveryengine.managed.allowedEgressFqdns",
+        "discoveryengine.managed.allowedDataSources",
+    ):
+        pol = gcloud_json(
+            ["org-policies", "describe", constraint, "--effective"],
+            project_id=project_id,
+        )
+        enforced = False
+        if pol:
+            for rule in pol.get("spec", {}).get("rules", []):
+                if rule.get("enforce") is True:
+                    enforced = True
+        if not enforced:
+            ok(f"Org policy '{constraint}' is not blocking.")
+        else:
+            warning(
+                f"Org policy '{constraint}' is enforced (will be overridden during `deploy`)."
+            )
+
+    # 5. Check Gemini Enterprise App (`geapp`)
+    print(f"\n{BOLD}[5/6] Gemini Enterprise App (geapp){RESET}")
+    engine = resolve_geapp_engine(project_id, ge_location, geapp["name"])
+    if engine:
+        eng_id = engine.get("name", "").split("/")[-1]
+        eng_display = engine.get("displayName", "")
+        agw_setting = (
+            engine.get("agentGatewaySetting", {})
+            .get("defaultEgressAgentGateway", {})
+            .get("name", "None")
+        )
+        ok(
+            f"Found geapp Engine: '{eng_id}' (displayName='{eng_display}', "
+            f"location='{ge_location}', defaultEgressAgentGateway='{agw_setting}')"
+        )
+    else:
+        fail(
+            f"Gemini Enterprise App '{geapp['name']}' not found in "
+            f"projects/{project_id}/locations/{ge_location}/collections/default_collection/engines."
+        )
+
+    # 6. Check Existing Static IP / Agent Gateway State
+    print(f"\n{BOLD}[6/6] Existing Agent Gateway & Static IP State{RESET}")
+    addr = gcloud_json(
+        ["compute", "addresses", "describe", d["nat_ip_name"], f"--region={agw_region}"],
+        project_id=project_id,
+    )
+    if addr and addr.get("address"):
+        ok(f"Reserved Static IP '{d['nat_ip_name']}' already exists: {addr['address']}")
+    else:
+        info(f"Reserved Static IP '{d['nat_ip_name']}' not yet created (will be created on `deploy`).")
+
+    agw = gcloud_json(
+        [
+            "alpha",
+            "network-services",
+            "agent-gateways",
+            "describe",
+            d["agw_name"],
+            f"--location={agw_region}",
+        ],
+        project_id=project_id,
+    )
+    if agw and agw.get("name"):
+        ok(f"Agent Gateway '{d['agw_name']}' already exists in {agw_region}.")
+    else:
+        info(f"Agent Gateway '{d['agw_name']}' not yet created (will be created on `deploy`).")
+
+    header("Preflight Summary")
+    print(f"  {GREEN}{passed} passed{RESET}  |  {YELLOW}{warned} warnings{RESET}  |  {RED}{failed} failed{RESET}")
+    if failed > 0:
+        error("Preflight failed. Please resolve the errors above before running `deploy`.")
+        return False
+    success("Preflight passed!")
+    return True
+
+
+def cmd_preflight(cfg: dict[str, Any], _args: argparse.Namespace) -> None:
+    if not run_preflight(cfg):
+        sys.exit(1)
+
+
+# ─── Subcommand: deploy ──────────────────────────────────────────────────────
+def _ensure_apis_and_identities(project_id: str, project_number: str) -> None:
+    header("Step 1/7: Enabling Required GCP APIs & Service Identities")
+    run_cmd(["gcloud", "services", "enable"] + REQUIRED_APIS + [f"--project={project_id}", "--quiet"])
+
+    for svc in SERVICE_IDENTITIES:
+        run_cmd(
+            [
+                "gcloud",
+                "beta",
+                "services",
+                "identity",
+                "create",
+                f"--service={svc}",
+                f"--project={project_id}",
+                "--quiet",
+            ],
+            check=False,
+        )
+
+    # Grant required roles to the Google-managed service agents
+    bindings = [
+        (
+            f"serviceAccount:service-{project_number}@gcp-sa-discoveryengine.iam.gserviceaccount.com",
+            "roles/discoveryengine.serviceAgent",
+        ),
+        (
+            f"serviceAccount:service-{project_number}@gcp-sa-discoveryengine.iam.gserviceaccount.com",
+            "roles/agentregistry.TempServiceAgent",
+        ),
+        (
+            f"serviceAccount:service-{project_number}@gcp-sa-agentgateway.iam.gserviceaccount.com",
+            "roles/agentgateway.serviceAgent",
+        ),
+        (
+            f"serviceAccount:service-{project_number}@gcp-sa-networkservices.iam.gserviceaccount.com",
+            "roles/networkservices.serviceAgent",
+        ),
+        (
+            f"serviceAccount:service-{project_number}@gcp-sa-iap.iam.gserviceaccount.com",
+            "roles/iap.egressServiceAgent",
+        ),
+    ]
+    for member, role in bindings:
+        run_cmd(
+            [
+                "gcloud",
+                "projects",
+                "add-iam-policy-binding",
+                project_id,
+                f"--member={member}",
+                f"--role={role}",
+                "--condition=None",
+                "--quiet",
+            ],
+            capture=True,
+            check=False,
+        )
+    success("APIs and Google-managed service agents configured.")
+
+
+def _ensure_org_policies(project_id: str) -> None:
+    header("Step 2/7: Ensuring Organization Policy Overrides for Custom MCP & IAM v3")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for constraint in (
+            "iam.managed.disableAccessPolicyBinding",
+            "discoveryengine.SkipCustomMcpRestriction",
+            "discoveryengine.managed.disableCustomMcpServerConnector",
+            "discoveryengine.managed.allowedEgressFqdns",
+            "discoveryengine.managed.allowedDataSources",
+        ):
+            pol_path = os.path.join(tmpdir, f"{constraint}.yaml")
+            with open(pol_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(
+                    {
+                        "name": f"projects/{project_id}/policies/{constraint}",
+                        "spec": {"rules": [{"enforce": False}]},
+                    },
+                    f,
+                )
+            res = run_cmd(
+                [
+                    "gcloud",
+                    "org-policies",
+                    "set-policy",
+                    pol_path,
+                    f"--project={project_id}",
+                    "--quiet",
+                ],
+                capture=True,
+                check=False,
+            )
+            if res.returncode == 0:
+                success(f"Org policy '{constraint}' set to enforce: false.")
+            else:
+                warn(
+                    f"Could not set org policy '{constraint}' (may already be false or lack orgpolicy.policyAdmin)."
+                )
+
+
+def _ensure_vpc_nat_psc(cfg: dict[str, Any]) -> str:
+    header("Step 3/7: Provisioning VPC, PSC Subnet, Cloud Router, Cloud NAT & Static IP")
+    project_id = cfg["gcp"]["project_id"]
+    psc_cidr = cfg["networking"]["psc_subnet_cidr"]
+    d = cfg["_derived"]
+    region = d["agw_region"]
+
+    # 1. VPC Network
+    if not gcloud_json(["compute", "networks", "describe", d["vpc_name"]], project_id):
+        run_cmd(
+            [
+                "gcloud",
+                "compute",
+                "networks",
+                "create",
+                d["vpc_name"],
+                "--subnet-mode=custom",
+                f"--project={project_id}",
+                "--quiet",
+            ]
+        )
+    else:
+        info(f"VPC '{d['vpc_name']}' already exists.")
+
+    # 2. PSC Subnet (with Private Google Access enabled)
+    if not gcloud_json(
+        ["compute", "networks", "subnets", "describe", d["psc_subnet_name"], f"--region={region}"],
+        project_id,
+    ):
+        run_cmd(
+            [
+                "gcloud",
+                "compute",
+                "networks",
+                "subnets",
+                "create",
+                d["psc_subnet_name"],
+                f"--network={d['vpc_name']}",
+                f"--region={region}",
+                f"--range={psc_cidr}",
+                "--enable-private-ip-google-access",
+                f"--project={project_id}",
+                "--quiet",
+            ]
+        )
+    else:
+        info(f"PSC Subnet '{d['psc_subnet_name']}' already exists.")
+
+    # 3. Reserved Static External IP for Cloud NAT
+    addr = gcloud_json(
+        ["compute", "addresses", "describe", d["nat_ip_name"], f"--region={region}"],
+        project_id,
+    )
+    if not addr:
+        run_cmd(
+            [
+                "gcloud",
+                "compute",
+                "addresses",
+                "create",
+                d["nat_ip_name"],
+                f"--region={region}",
+                f"--project={project_id}",
+                "--quiet",
+            ]
+        )
+        addr = gcloud_json(
+            ["compute", "addresses", "describe", d["nat_ip_name"], f"--region={region}"],
+            project_id,
+        )
+    static_ip = (addr or {}).get("address", "")
+    if not static_ip:
+        error(f"Failed to resolve Static External IP address for '{d['nat_ip_name']}'.")
+        sys.exit(1)
+    success(f"Reserved Static Outbound IP ({d['nat_ip_name']}): {BOLD}{static_ip}{RESET}")
+
+    # 4. Cloud Router
+    if not gcloud_json(
+        ["compute", "routers", "describe", d["router_name"], f"--region={region}"],
+        project_id,
+    ):
+        run_cmd(
+            [
+                "gcloud",
+                "compute",
+                "routers",
+                "create",
+                d["router_name"],
+                f"--network={d['vpc_name']}",
+                f"--region={region}",
+                f"--project={project_id}",
+                "--quiet",
+            ]
+        )
+    else:
+        info(f"Cloud Router '{d['router_name']}' already exists.")
+
+    # 5. Cloud NAT pinned to the Reserved Static External IP
+    nat_info = gcloud_json(
+        [
+            "compute",
+            "routers",
+            "nats",
+            "describe",
+            d["nat_name"],
+            f"--router={d['router_name']}",
+            f"--region={region}",
+        ],
+        project_id,
+    )
+    if not nat_info:
+        run_cmd(
+            [
+                "gcloud",
+                "compute",
+                "routers",
+                "nats",
+                "create",
+                d["nat_name"],
+                f"--router={d['router_name']}",
+                f"--region={region}",
+                "--nat-all-subnet-ip-ranges",
+                f"--nat-external-ip-pool={d['nat_ip_name']}",
+                "--enable-logging",
+                f"--project={project_id}",
+                "--quiet",
+            ]
+        )
+    else:
+        info(f"Cloud NAT '{d['nat_name']}' already exists.")
+
+    # 6. PSC Network Attachment (ACCEPT_AUTOMATIC)
+    na_info = gcloud_json(
+        [
+            "compute",
+            "network-attachments",
+            "describe",
+            d["attachment_name"],
+            f"--region={region}",
+        ],
+        project_id,
+    )
+    if not na_info:
+        run_cmd(
+            [
+                "gcloud",
+                "compute",
+                "network-attachments",
+                "create",
+                d["attachment_name"],
+                f"--region={region}",
+                f"--subnets={d['psc_subnet_name']}",
+                "--connection-preference=ACCEPT_AUTOMATIC",
+                f"--project={project_id}",
+                "--quiet",
+            ]
+        )
+    else:
+        info(f"PSC Network Attachment '{d['attachment_name']}' already exists.")
+
+    success(
+        f"Networking ready in {region}: PSC Attachment '{d['attachment_name']}' -> "
+        f"Cloud NAT '{d['nat_name']}' -> Static IP {static_ip}"
+    )
+    return static_ip
+
+
+def _ensure_agent_gateway_and_act(
+    cfg: dict[str, Any], project_number: str
+) -> dict[str, Any]:
+    header("Step 4/7: Provisioning AgentConnectivityTemplate (ALL_TRAFFIC) & Agent Gateway")
+    project_id = cfg["gcp"]["project_id"]
+    d = cfg["_derived"]
+    region = d["agw_region"]
+
+    act_full_name = (
+        f"projects/{project_number}/locations/{region}"
+        f"/agentConnectivityTemplates/{d['act_name']}"
+    )
+    na_full_name = (
+        f"projects/{project_id}/regions/{region}"
+        f"/networkAttachments/{d['attachment_name']}"
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 1. AgentConnectivityTemplate with vpcEgress: ALL_TRAFFIC
+        act_yaml_path = os.path.join(tmpdir, "act.yaml")
+        act_spec = {
+            "accessPath": "AGENT_TO_ANYWHERE",
+            "name": act_full_name,
+            "deploymentModel": "CENTRALIZED",
+            "egressNetworkConfig": {
+                "networkAttachment": na_full_name,
+                "vpcEgress": "ALL_TRAFFIC",
+            },
+        }
+        with open(act_yaml_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(act_spec, f, sort_keys=False)
+
+        run_cmd(
+            [
+                "gcloud",
+                "alpha",
+                "network-services",
+                "agent-connectivity-templates",
+                "import",
+                d["act_name"],
+                f"--location={region}",
+                f"--source={act_yaml_path}",
+                f"--project={project_id}",
+                "--quiet",
+            ]
+        )
+        success(f"AgentConnectivityTemplate '{d['act_name']}' imported (vpcEgress=ALL_TRAFFIC).")
+
+        # 2. AgentGateway referencing the AgentConnectivityTemplate and Agent Registry
+        agw_yaml_path = os.path.join(tmpdir, "agw.yaml")
+        agw_spec = {
+            "name": d["agw_name"],
+            "protocols": ["MCP"],
+            "googleManaged": {
+                "governedAccessPath": "AGENT_TO_ANYWHERE",
+            },
+            "agentConnectivityTemplate": act_full_name,
+            "registries": [
+                f"//agentregistry.googleapis.com/projects/{project_id}/locations/{region}"
+            ],
+        }
+        with open(agw_yaml_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(agw_spec, f, sort_keys=False)
+
+        run_cmd(
+            [
+                "gcloud",
+                "alpha",
+                "network-services",
+                "agent-gateways",
+                "import",
+                d["agw_name"],
+                f"--location={region}",
+                f"--source={agw_yaml_path}",
+                f"--project={project_id}",
+                "--quiet",
+            ]
+        )
+
+    agw_info = gcloud_json(
+        [
+            "alpha",
+            "network-services",
+            "agent-gateways",
+            "describe",
+            d["agw_name"],
+            f"--location={region}",
+        ],
+        project_id,
+    )
+    if not agw_info:
+        error(f"Failed to describe Agent Gateway '{d['agw_name']}' after import.")
+        sys.exit(1)
+    success(f"Agent Gateway '{d['agw_name']}' ready in {region}.")
+    return agw_info
+
+
+def _ensure_authz_extension_and_policy(cfg: dict[str, Any]) -> None:
+    header("Step 5/7: Provisioning IAP AuthzExtension & Network Security AuthzPolicy")
+    project_id = cfg["gcp"]["project_id"]
+    d = cfg["_derived"]
+    region = d["agw_region"]
+
+    agw_uri = f"projects/{project_id}/locations/{region}/agentGateways/{d['agw_name']}"
+    ext_uri = f"projects/{project_id}/locations/{region}/authzExtensions/{d['authz_ext_name']}"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 1. Service Extensions AuthzExtension (IAP Egress V2)
+        ext_yaml_path = os.path.join(tmpdir, "authz-ext.yaml")
+        ext_spec = {
+            "name": d["authz_ext_name"],
+            "service": "iap.googleapis.com",
+            "failOpen": False,
+            "timeout": "1s",
+            "metadata": {
+                "iapPolicyVersion": "V2",
+            },
+        }
+        with open(ext_yaml_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(ext_spec, f, sort_keys=False)
+
+        run_cmd(
+            [
+                "gcloud",
+                "service-extensions",
+                "authz-extensions",
+                "import",
+                d["authz_ext_name"],
+                f"--location={region}",
+                f"--source={ext_yaml_path}",
+                f"--project={project_id}",
+                "--quiet",
+            ]
+        )
+        success(f"AuthzExtension '{d['authz_ext_name']}' imported.")
+
+        # 2. Network Security AuthzPolicy targeting the Agent Gateway
+        pol_yaml_path = os.path.join(tmpdir, "authz-policy.yaml")
+        pol_spec = {
+            "name": d["authz_policy_name"],
+            "target": {
+                "resources": [agw_uri],
+            },
+            "policyProfile": "REQUEST_AUTHZ",
+            "action": "CUSTOM",
+            "customProvider": {
+                "authzExtension": {
+                    "resources": [ext_uri],
+                }
+            },
+        }
+        with open(pol_yaml_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(pol_spec, f, sort_keys=False)
+
+        run_cmd(
+            [
+                "gcloud",
+                "network-security",
+                "authz-policies",
+                "import",
+                d["authz_policy_name"],
+                f"--location={region}",
+                f"--source={pol_yaml_path}",
+                f"--project={project_id}",
+                "--quiet",
+            ]
+        )
+        success(f"AuthzPolicy '{d['authz_policy_name']}' imported and bound to Agent Gateway.")
+
+
+def _ensure_agent_registry_and_iam_v3(
+    cfg: dict[str, Any], project_number: str, org_id: str, engine_id: str
+) -> str:
+    header("Step 6/7: Registering MCP Server in Agent Registry & Configuring IAM v3 Access Policy")
+    project_id = cfg["gcp"]["project_id"]
+    mcp_url = cfg["mcp_server"]["url"]
+    d = cfg["_derived"]
+    region = d["agw_region"]
+    ge_location = d["ge_location"]
+
+    # 1. Register MCP server in Agent Registry
+    existing_svc = gcloud_json(
+        [
+            "agent-registry",
+            "services",
+            "describe",
+            d["mcp_reg_name"],
+            f"--location={region}",
+        ],
+        project_id,
+    )
+    if not existing_svc:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            toolspec_path = os.path.join(tmpdir, "toolspec.json")
+            with open(toolspec_path, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_MCP_TOOLS_SPEC, f, indent=2)
+
+            run_cmd(
+                [
+                    "gcloud",
+                    "agent-registry",
+                    "services",
+                    "create",
+                    d["mcp_reg_name"],
+                    f"--location={region}",
+                    f"--display-name={d['connector_display_name']}",
+                    "--description=Remote Hello World MCP server accessed via Agent Gateway static IP",
+                    f"--interfaces=protocolBinding=JSONRPC,url={mcp_url}",
+                    "--mcp-server-spec-type=tool-spec",
+                    f"--mcp-server-spec-content={toolspec_path}",
+                    f"--project={project_id}",
+                    "--quiet",
+                ]
+            )
+    else:
+        info(f"Agent Registry service '{d['mcp_reg_name']}' already exists.")
+
+    # Wait briefly for Agent Registry to materialize the projected McpServer resource
+    mcp_server_resource_name = (
+        f"projects/{project_id}/locations/{region}/mcpServers/{d['mcp_reg_name']}"
+    )
+    mcp_server_uid = ""
+    for _ in range(10):
+        servers = gcloud_json(
+            ["agent-registry", "mcp-servers", "list", f"--location={region}"],
+            project_id,
+        )
+        if isinstance(servers, list):
+            for srv in servers:
+                name = srv.get("name", "")
+                if (
+                    d["mcp_reg_name"] in name
+                    or srv.get("displayName") == d["connector_display_name"]
+                ):
+                    mcp_server_resource_name = name
+                    mcp_server_uid = srv.get("mcpServerId", "") or name.split("/")[-1]
+                    break
+        if mcp_server_uid:
+            break
+        time.sleep(2)
+
+    success(
+        f"Agent Registry MCP Server ready: {mcp_server_resource_name} "
+        f"(mcpServerId={mcp_server_uid or 'pending'})"
+    )
+
+    # 2. Create IAM v3 AccessPolicy & PolicyBinding (IAP V2 Unified Access Policy)
+    #    authorizing the geapp's default_assistant SPIFFE identities.
+    if not org_id:
+        error(
+            f"Could not determine Organization ID for project '{project_id}', "
+            "which is required to construct the SPIFFE principal for IAM v3 AccessPolicy."
+        )
+        sys.exit(1)
+
+    principals = [
+        (
+            f"principal://agents.global.org-{org_id}.system.id.goog/resources/discoveryengine"
+            f"/projects/{project_number}/locations/{ge_location}/engines/{engine_id}"
+            f"/assistants/default_assistant/agents/default/core_assistant"
+        ),
+        (
+            f"principal://agents.global.org-{org_id}.system.id.goog/resources/aiplatform"
+            f"/projects/{project_number}/locations/{ge_location}/collections/default_collection"
+            f"/engines/{engine_id}/assistants/default_assistant"
+        ),
+    ]
+
+    existing_ap = gcloud_json(
+        [
+            "iam",
+            "access-policies",
+            "describe",
+            d["iap_policy_name"],
+            "--location=global",
+        ],
+        project_id,
+    )
+    if not existing_ap:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rules_path = os.path.join(tmpdir, "iap_rules.json")
+            rule_payload = [
+                {
+                    "description": f"allow geapp {engine_id} assistant to any registered service",
+                    "effect": "ALLOW",
+                    "principals": principals,
+                    "operation": {
+                        "permissions": [
+                            "iap.googleapis.com/resources.egressViaIAP",
+                        ],
+                    },
+                    "conditions": {
+                        "iap.googleapis.com": {
+                            "expression": "destination.is_registered == true",
+                        }
+                    },
+                }
+            ]
+            with open(rules_path, "w", encoding="utf-8") as f:
+                json.dump(rule_payload, f, indent=2)
+
+            run_cmd(
+                [
+                    "gcloud",
+                    "iam",
+                    "access-policies",
+                    "create",
+                    d["iap_policy_name"],
+                    "--location=global",
+                    f"--display-name={d['iap_policy_name']}",
+                    f"--details-rules={rules_path}",
+                    f"--project={project_id}",
+                    "--quiet",
+                ]
+            )
+        success(f"IAM v3 AccessPolicy '{d['iap_policy_name']}' created.")
+    else:
+        info(f"IAM v3 AccessPolicy '{d['iap_policy_name']}' already exists.")
+
+    existing_pb = gcloud_json(
+        [
+            "iam",
+            "policy-bindings",
+            "describe",
+            d["iap_binding_name"],
+            "--location=global",
+        ],
+        project_id,
+    )
+    if not existing_pb:
+        target_resource = f"//cloudresourcemanager.googleapis.com/projects/{project_id}"
+        policy_ref = f"projects/{project_id}/locations/global/accessPolicies/{d['iap_policy_name']}"
+        run_cmd(
+            [
+                "gcloud",
+                "iam",
+                "policy-bindings",
+                "create",
+                d["iap_binding_name"],
+                "--location=global",
+                f"--policy={policy_ref}",
+                f"--target-resource={target_resource}",
+                f"--project={project_id}",
+                "--quiet",
+            ]
+        )
+        success(f"IAM v3 PolicyBinding '{d['iap_binding_name']}' bound to {target_resource}.")
+    else:
+        info(f"IAM v3 PolicyBinding '{d['iap_binding_name']}' already exists.")
+
+    return mcp_server_resource_name
+
+
+def _ensure_geapp_and_mcp_connector(
+    cfg: dict[str, Any],
+    project_number: str,
+    engine: dict[str, Any],
+    mcp_server_resource_name: str,
+) -> dict[str, Any]:
+    header("Step 7/7: Wiring Agent Gateway & Custom MCP Connector into Gemini Enterprise (geapp)")
+    project_id = cfg["gcp"]["project_id"]
+    mcp_url = cfg["mcp_server"]["url"]
+    d = cfg["_derived"]
+    ge_location = d["ge_location"]
+    agw_region = d["agw_region"]
+    collection_id = d["connector_id"]
+    engine_id = engine["name"].split("/")[-1]
+
+    headers = de_headers(project_id)
+    v1_base = de_base_url(ge_location, "v1")
+    v1alpha_base = de_base_url(ge_location, "v1alpha")
+
+    # 1. Patch the geapp Engine's `agentGatewaySetting.defaultEgressAgentGateway.name`
+    agw_resource = f"projects/{project_id}/locations/{agw_region}/agentGateways/{d['agw_name']}"
+    engine_patch_url = (
+        f"{v1_base}/projects/{project_id}/locations/{ge_location}"
+        f"/collections/default_collection/engines/{engine_id}"
+        "?updateMask=agentGatewaySetting.defaultEgressAgentGateway.name"
+    )
+    patch_body = {
+        "agentGatewaySetting": {
+            "defaultEgressAgentGateway": {
+                "name": agw_resource,
+            }
+        }
+    }
+    resp = requests.patch(engine_patch_url, headers=headers, json=patch_body, timeout=30)
+    if resp.status_code != 200:
+        error(
+            f"Failed patching defaultEgressAgentGateway on Engine '{engine_id}': "
+            f"HTTP {resp.status_code} {resp.text}"
+        )
+        sys.exit(1)
+    success(f"Bound Agent Gateway '{agw_resource}' to geapp Engine '{engine_id}'.")
+
+    # 2. Create and activate the Custom MCP DataConnector in Gemini Enterprise
+    existing_dc = get_data_connector(project_id, ge_location, collection_id)
+    agw_engine_resource = (
+        f"projects/{project_id}/locations/{ge_location}"
+        f"/collections/default_collection/engines/{engine_id}"
+    )
+    action_params = {
+        "auth_type": "NO_AUTH",
+        "instance_uri": mcp_url,
+        "mcp_server_source": "REGISTRY_MCP",
+        "registry_mcp_server_name": mcp_server_resource_name,
+        "mcp_agent_instructions": (
+            "MANDATORY HELLO MCP AGENT: Always invoke the hello or hello_from_ip "
+            "tool whenever the user asks to greet someone, say hello, or check "
+            "what incoming IP address or headers the MCP server sees."
+        ),
+        "use_agent_gateway_egress": True,
+        "agent_gateway_engine": agw_engine_resource,
+    }
+
+    if not existing_dc:
+        setup_url = (
+            f"{v1alpha_base}/projects/{project_id}/locations/{ge_location}"
+            ":setUpDataConnector"
+        )
+        setup_payload = {
+            "collectionId": collection_id,
+            "collectionDisplayName": d["connector_display_name"],
+            "dataConnector": {
+                "dataSource": "custom_mcp",
+                "dataSourceVersion": 1,
+                "params": {
+                    "oauth_access_token": "unused",
+                },
+                "refreshInterval": "86400s",
+                "entities": [
+                    {
+                        "entityName": "mcp_data",
+                    }
+                ],
+                "connectorModes": [
+                    "FEDERATED",
+                ],
+                "actionConfig": {
+                    "isActionConfigured": True,
+                    "createBapConnection": True,
+                    "actionParams": dict(action_params),
+                },
+            },
+        }
+        info(f"Creating Custom MCP DataConnector in collection '{collection_id}'...")
+        setup_resp = requests.post(setup_url, headers=headers, json=setup_payload, timeout=60)
+        if setup_resp.status_code != 200:
+            error(
+                f"Failed calling setUpDataConnector for '{collection_id}': "
+                f"HTTP {setup_resp.status_code} {setup_resp.text}"
+            )
+            sys.exit(1)
+        op_data = setup_resp.json()
+        op_name = op_data.get("name", "")
+        if op_name and not op_data.get("done"):
+            info(f"Waiting for DataConnector provisioning LRO ({op_name})...")
+            poll_discovery_engine_lro(project_id, ge_location, op_name)
+        success(f"Custom MCP DataConnector '{collection_id}' created.")
+    else:
+        info(f"Custom MCP DataConnector '{collection_id}' already exists.")
+
+    # Activate the DataConnector actionConfig & bind to the Agent Gateway Engine
+    activate_url = (
+        f"{v1alpha_base}/projects/{project_id}/locations/{ge_location}"
+        f"/collections/{collection_id}/dataConnector?updateMask=actionConfig"
+    )
+    activate_payload = {
+        "name": f"projects/{project_id}/locations/{ge_location}/collections/{collection_id}/dataConnector",
+        "actionConfig": {
+            "isActionConfigured": True,
+            "createBapConnection": True,
+            "actionParams": dict(action_params),
+        },
+    }
+    info(f"Activating Custom MCP DataConnector '{collection_id}' and linking to Engine '{engine_id}'...")
+    act_resp = requests.patch(activate_url, headers=headers, json=activate_payload, timeout=60)
+    if act_resp.status_code != 200:
+        error(
+            f"Failed activating DataConnector '{collection_id}': "
+            f"HTTP {act_resp.status_code} {act_resp.text}"
+        )
+        sys.exit(1)
+    existing_dc = get_data_connector(project_id, ge_location, collection_id)
+    success(
+        f"Activated Custom MCP DataConnector '{collection_id}' "
+        f"(state={(existing_dc or {}).get('state')}, actionState={(existing_dc or {}).get('actionState')})."
+    )
+
+    # 3. Ensure `${collection_id}_mcp_data` is attached to the geapp Engine's `dataStoreIds`
+    #    and detach any legacy non-Agent-Gateway MCP dataStore pointing to the same MCP URL
+    #    so prompts issued from geapp always route through the Agent Gateway static IP.
+    latest_engine = resolve_geapp_engine(project_id, ge_location, engine_id) or engine
+    current_ds_ids = list(latest_engine.get("dataStoreIds", []))
+    mcp_ds_id = f"{collection_id}_mcp_data"
+    cleaned_ds_ids: list[str] = []
+    removed_legacy: list[str] = []
+    for ds_id in current_ds_ids:
+        if ds_id != mcp_ds_id and ds_id.endswith("_mcp_data"):
+            other_coll = ds_id[: -len("_mcp_data")]
+            other_dc = get_data_connector(project_id, ge_location, other_coll)
+            other_uri = (
+                (other_dc or {}).get("actionConfig", {}).get("actionParams", {}).get("instance_uri")
+                or (other_dc or {}).get("params", {}).get("instance_uri")
+            )
+            if other_uri == mcp_url:
+                removed_legacy.append(ds_id)
+                continue
+        cleaned_ds_ids.append(ds_id)
+
+    if mcp_ds_id not in cleaned_ds_ids:
+        cleaned_ds_ids.append(mcp_ds_id)
+
+    if cleaned_ds_ids != current_ds_ids:
+        ds_patch_url = (
+            f"{v1alpha_base}/projects/{project_number}/locations/{ge_location}"
+            f"/collections/default_collection/engines/{engine_id}"
+            "?updateMask=dataStoreIds"
+        )
+        ds_resp = requests.patch(
+            ds_patch_url,
+            headers=headers,
+            json={"dataStoreIds": cleaned_ds_ids},
+            timeout=30,
+        )
+        if ds_resp.status_code != 200:
+            error(
+                f"Failed updating dataStoreIds on Engine '{engine_id}': "
+                f"HTTP {ds_resp.status_code} {ds_resp.text}"
+            )
+            sys.exit(1)
+        if removed_legacy:
+            info(
+                f"Detached non-AGW MCP DataStore(s) targeting {mcp_url}: "
+                f"{', '.join(removed_legacy)}"
+            )
+        success(f"Attached MCP DataStore '{mcp_ds_id}' to geapp Engine '{engine_id}'.")
+    else:
+        info(f"MCP DataStore '{mcp_ds_id}' is attached to geapp Engine '{engine_id}'.")
+
+    return existing_dc or {}
+
+
+def cmd_deploy(cfg: dict[str, Any], _args: argparse.Namespace) -> None:
+    if not run_preflight(cfg):
+        sys.exit(1)
+
+    project_id = cfg["gcp"]["project_id"]
+    ge_location = cfg["_derived"]["ge_location"]
+    geapp_name = cfg["geapp"]["name"]
+
+    project_number = get_project_number(project_id)
+    org_id = get_org_id(project_id)
+    engine = resolve_geapp_engine(project_id, ge_location, geapp_name)
+    if not engine:
+        error(f"Could not resolve geapp '{geapp_name}'.")
+        sys.exit(1)
+    engine_id = engine["name"].split("/")[-1]
+
+    _ensure_apis_and_identities(project_id, project_number)
+    _ensure_org_policies(project_id)
+    static_ip = _ensure_vpc_nat_psc(cfg)
+    _ensure_agent_gateway_and_act(cfg, project_number)
+    _ensure_authz_extension_and_policy(cfg)
+    mcp_server_resource = _ensure_agent_registry_and_iam_v3(
+        cfg, project_number, org_id, engine_id
+    )
+    _ensure_geapp_and_mcp_connector(cfg, project_number, engine, mcp_server_resource)
+
+    header("Deployment Complete")
+    print(f"  {BOLD}Gemini Enterprise App:{RESET}  {engine_id} (location: {ge_location})")
+    print(f"  {BOLD}MCP Connector ID:{RESET}       {cfg['_derived']['connector_id']}")
+    print(f"  {BOLD}Agent Gateway:{RESET}          {cfg['_derived']['agw_name']} ({cfg['_derived']['agw_region']})")
+    print(f"  {BOLD}Remote MCP Endpoint:{RESET}    {cfg['mcp_server']['url']}")
+    print(f"  {BOLD}Static Outbound IP:{RESET}     {GREEN}{BOLD}{static_ip}{RESET}")
+    print(
+        f"\n{CYAN}Allowlists on your remote MCP server:{RESET} "
+        f"Allow incoming TCP connections from {BOLD}{static_ip}/32{RESET}."
+    )
+
+
+# ─── Subcommand: describe ────────────────────────────────────────────────────
+def cmd_describe(cfg: dict[str, Any], _args: argparse.Namespace) -> None:
+    project_id = cfg["gcp"]["project_id"]
+    d = cfg["_derived"]
+    ge_location = d["ge_location"]
+    region = d["agw_region"]
+
+    header("Static Outbound IP & Cloud NAT Status")
+    addr = gcloud_json(
+        ["compute", "addresses", "describe", d["nat_ip_name"], f"--region={region}"],
+        project_id,
+    )
+    if addr and addr.get("address"):
+        print(f"  {BOLD}Reserved Static IP:{RESET}     {GREEN}{BOLD}{addr['address']}{RESET} ({addr.get('status')})")
+    else:
+        warn(f"  Reserved Static IP '{d['nat_ip_name']}' not found in {region}.")
+
+    na = gcloud_json(
+        ["compute", "network-attachments", "describe", d["attachment_name"], f"--region={region}"],
+        project_id,
+    )
+    if na:
+        print(f"  {BOLD}PSC Network Attachment:{RESET} {na.get('name')} ({na.get('connectionPreference')})")
+        endpoints = na.get("connectionEndpoints", [])
+        print(f"  {BOLD}Connected PSC Endpoints:{RESET} {len(endpoints)}")
+    else:
+        warn(f"  PSC Network Attachment '{d['attachment_name']}' not found in {region}.")
+
+    header("Agent Gateway & Connectivity Template Status")
+    act = gcloud_json(
+        [
+            "alpha",
+            "network-services",
+            "agent-connectivity-templates",
+            "describe",
+            d["act_name"],
+            f"--location={region}",
+        ],
+        project_id,
+    )
+    if act:
+        egress_cfg = act.get("egressNetworkConfig", {})
+        print(
+            f"  {BOLD}Connectivity Template:{RESET}  {d['act_name']} "
+            f"(state={act.get('state', 'READY')}, vpcEgress={egress_cfg.get('vpcEgress')})"
+        )
+    else:
+        warn(f"  AgentConnectivityTemplate '{d['act_name']}' not found in {region}.")
+
+    agw = gcloud_json(
+        [
+            "alpha",
+            "network-services",
+            "agent-gateways",
+            "describe",
+            d["agw_name"],
+            f"--location={region}",
+        ],
+        project_id,
+    )
+    if agw:
+        card = agw.get("agentGatewayCard") or {}
+        sa = card.get("serviceExtensionsServiceAccount") or card.get("serviceAccount", "N/A")
+        print(
+            f"  {BOLD}Agent Gateway:{RESET}          {d['agw_name']} "
+            f"(protocols={agw.get('protocols')}, serviceAccount={sa})"
+        )
+    else:
+        warn(f"  Agent Gateway '{d['agw_name']}' not found in {region}.")
+
+    header("Gemini Enterprise (geapp) & Custom MCP Connector Status")
+    engine = resolve_geapp_engine(project_id, ge_location, cfg["geapp"]["name"])
+    if engine:
+        eng_id = engine.get("name", "").split("/")[-1]
+        default_agw = (
+            engine.get("agentGatewaySetting", {})
+            .get("defaultEgressAgentGateway", {})
+            .get("name", "None")
+        )
+        print(f"  {BOLD}Engine ID:{RESET}              {eng_id} (displayName='{engine.get('displayName')}')")
+        print(f"  {BOLD}Default Egress Gateway:{RESET} {default_agw}")
+        print(f"  {BOLD}Linked DataStores:{RESET}      {', '.join(engine.get('dataStoreIds', [])) or 'None'}")
+    else:
+        warn(f"  Gemini Enterprise Engine '{cfg['geapp']['name']}' not found.")
+
+    dc = get_data_connector(project_id, ge_location, d["connector_id"])
+    if dc:
+        action_params = dc.get("actionConfig", {}).get("actionParams", {})
+        params = dc.get("params", {})
+        mcp_src = action_params.get("mcp_server_source") or params.get("mcp_server_source")
+        mcp_uri = action_params.get("instance_uri") or params.get("instance_uri")
+        reg_name = action_params.get("registry_mcp_server_name") or params.get("registry_mcp_server_name")
+        use_agw = action_params.get("use_agent_gateway_egress", params.get("use_agent_gateway_egress"))
+        print(
+            f"  {BOLD}MCP DataConnector:{RESET}      {d['connector_id']} "
+            f"(state={dc.get('state')}, actionState={dc.get('actionState')})"
+        )
+        print(
+            f"  {BOLD}MCP Source & URI:{RESET}       {mcp_src} -> {mcp_uri} "
+            f"(use_agent_gateway_egress={use_agw})"
+        )
+        print(f"  {BOLD}Registry MCP Server:{RESET}    {reg_name}")
+    else:
+        warn(f"  MCP DataConnector '{d['connector_id']}' not deployed.")
+
+
+# ─── Subcommand: undeploy ────────────────────────────────────────────────────
+def cmd_undeploy(cfg: dict[str, Any], _args: argparse.Namespace) -> None:
+    project_id = cfg["gcp"]["project_id"]
+    project_number = get_project_number(project_id)
+    d = cfg["_derived"]
+    ge_location = d["ge_location"]
+    region = d["agw_region"]
+    collection_id = d["connector_id"]
+    headers = de_headers(project_id)
+    v1_base = de_base_url(ge_location, "v1")
+    v1alpha_base = de_base_url(ge_location, "v1alpha")
+
+    header("Step 1/4: Detaching MCP Connector & Agent Gateway from Gemini Enterprise (geapp)")
+    engine = resolve_geapp_engine(project_id, ge_location, cfg["geapp"]["name"])
+    if engine:
+        engine_id = engine["name"].split("/")[-1]
+        mcp_ds_id = f"{collection_id}_mcp_data"
+        current_ds_ids = list(engine.get("dataStoreIds", []))
+        if mcp_ds_id in current_ds_ids:
+            updated_ds_ids = [ds for ds in current_ds_ids if ds != mcp_ds_id]
+            ds_patch_url = (
+                f"{v1alpha_base}/projects/{project_number}/locations/{ge_location}"
+                f"/collections/default_collection/engines/{engine_id}"
+                "?updateMask=dataStoreIds"
+            )
+            requests.patch(
+                ds_patch_url,
+                headers=headers,
+                json={"dataStoreIds": updated_ds_ids},
+                timeout=30,
+            )
+            success(f"Detached DataStore '{mcp_ds_id}' from Engine '{engine_id}'.")
+
+        agw_name_on_engine = (
+            engine.get("agentGatewaySetting", {})
+            .get("defaultEgressAgentGateway", {})
+            .get("name", "")
+        )
+        if agw_name_on_engine.endswith(f"/agentGateways/{d['agw_name']}"):
+            agw_patch_url = (
+                f"{v1_base}/projects/{project_id}/locations/{ge_location}"
+                f"/collections/default_collection/engines/{engine_id}"
+                "?updateMask=agentGatewaySetting.defaultEgressAgentGateway.name"
+            )
+            requests.patch(
+                agw_patch_url,
+                headers=headers,
+                json={"agentGatewaySetting": {"defaultEgressAgentGateway": {"name": ""}}},
+                timeout=30,
+            )
+            success(f"Cleared defaultEgressAgentGateway on Engine '{engine_id}'.")
+
+    # Delete the MCP DataConnector collection
+    if get_data_connector(project_id, ge_location, collection_id):
+        del_url = (
+            f"{v1alpha_base}/projects/{project_id}/locations/{ge_location}"
+            f"/collections/{collection_id}"
+        )
+        del_resp = requests.delete(del_url, headers=headers, timeout=60)
+        if del_resp.status_code == 200:
+            op = del_resp.json()
+            if op.get("name") and not op.get("done"):
+                try:
+                    poll_discovery_engine_lro(project_id, ge_location, op["name"])
+                except Exception as exc:
+                    warn(f"Collection deletion LRO warning: {exc}")
+            success(f"Deleted Custom MCP collection '{collection_id}'.")
+
+    header("Step 2/4: Deleting IAM v3 Policy Binding, Access Policy & Agent Registry Service")
+    for cmd in [
+        [
+            "gcloud",
+            "iam",
+            "policy-bindings",
+            "delete",
+            d["iap_binding_name"],
+            "--location=global",
+            f"--project={project_id}",
+            "--quiet",
+        ],
+        [
+            "gcloud",
+            "iam",
+            "access-policies",
+            "delete",
+            d["iap_policy_name"],
+            "--location=global",
+            "--force",
+            f"--project={project_id}",
+            "--quiet",
+        ],
+        [
+            "gcloud",
+            "agent-registry",
+            "services",
+            "delete",
+            d["mcp_reg_name"],
+            f"--location={region}",
+            f"--project={project_id}",
+            "--quiet",
+        ],
+    ]:
+        run_cmd(cmd, capture=True, check=False)
+    success("Removed IAM v3 bindings and Agent Registry service.")
+
+    header("Step 3/4: Deleting AuthzPolicy, AuthzExtension, Agent Gateway & Connectivity Template")
+    for cmd in [
+        [
+            "gcloud",
+            "network-security",
+            "authz-policies",
+            "delete",
+            d["authz_policy_name"],
+            f"--location={region}",
+            f"--project={project_id}",
+            "--quiet",
+        ],
+        [
+            "gcloud",
+            "service-extensions",
+            "authz-extensions",
+            "delete",
+            d["authz_ext_name"],
+            f"--location={region}",
+            f"--project={project_id}",
+            "--quiet",
+        ],
+        [
+            "gcloud",
+            "alpha",
+            "network-services",
+            "agent-gateways",
+            "delete",
+            d["agw_name"],
+            f"--location={region}",
+            f"--project={project_id}",
+            "--quiet",
+        ],
+        [
+            "gcloud",
+            "alpha",
+            "network-services",
+            "agent-connectivity-templates",
+            "delete",
+            d["act_name"],
+            f"--location={region}",
+            f"--project={project_id}",
+            "--quiet",
+        ],
+    ]:
+        run_cmd(cmd, capture=True, check=False)
+    success("Removed AuthzPolicy, AuthzExtension, Agent Gateway, and AgentConnectivityTemplate.")
+
+    header("Step 4/4: Deleting PSC Network Attachment, Cloud NAT, Cloud Router, Static IP & VPC")
+    # Wait briefly for producer PSC endpoints to release the Network Attachment
+    for _ in range(12):
+        na = gcloud_json(
+            ["compute", "network-attachments", "describe", d["attachment_name"], f"--region={region}"],
+            project_id,
+        )
+        if not na:
+            break
+        res = run_cmd(
+            [
+                "gcloud",
+                "compute",
+                "network-attachments",
+                "delete",
+                d["attachment_name"],
+                f"--region={region}",
+                f"--project={project_id}",
+                "--quiet",
+            ],
+            capture=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            break
+        time.sleep(5)
+
+    for cmd in [
+        [
+            "gcloud",
+            "compute",
+            "routers",
+            "nats",
+            "delete",
+            d["nat_name"],
+            f"--router={d['router_name']}",
+            f"--region={region}",
+            f"--project={project_id}",
+            "--quiet",
+        ],
+        [
+            "gcloud",
+            "compute",
+            "routers",
+            "delete",
+            d["router_name"],
+            f"--region={region}",
+            f"--project={project_id}",
+            "--quiet",
+        ],
+        [
+            "gcloud",
+            "compute",
+            "addresses",
+            "delete",
+            d["nat_ip_name"],
+            f"--region={region}",
+            f"--project={project_id}",
+            "--quiet",
+        ],
+        [
+            "gcloud",
+            "compute",
+            "networks",
+            "subnets",
+            "delete",
+            d["psc_subnet_name"],
+            f"--region={region}",
+            f"--project={project_id}",
+            "--quiet",
+        ],
+        [
+            "gcloud",
+            "compute",
+            "networks",
+            "delete",
+            d["vpc_name"],
+            f"--project={project_id}",
+            "--quiet",
+        ],
+    ]:
+        run_cmd(cmd, capture=True, check=False)
+
+    success("All Agent Gateway and Static IP networking resources have been torn down.")
+
+
+# ─── Subcommand: send ────────────────────────────────────────────────────────
+def cmd_send(cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    project_id = cfg["gcp"]["project_id"]
+    d = cfg["_derived"]
+    ge_location = d["ge_location"]
+
+    engine = resolve_geapp_engine(project_id, ge_location, cfg["geapp"]["name"])
+    if not engine:
+        error(f"Gemini Enterprise App '{cfg['geapp']['name']}' not found.")
+        sys.exit(1)
+    engine_id = engine["name"].split("/")[-1]
+
+    project_number = get_project_number(project_id)
+    mcp_ds_resource = (
+        f"projects/{project_number}/locations/{ge_location}"
+        f"/collections/default_collection/dataStores/{d['collection_id']}_mcp_data"
+    )
+    stream_url = (
+        f"{de_base_url(ge_location, 'v1alpha')}/projects/{project_id}"
+        f"/locations/{ge_location}/collections/default_collection"
+        f"/engines/{engine_id}/assistants/default_assistant:streamAssist"
+    )
+    payload: dict[str, Any] = {
+        "query": {"text": args.prompt},
+        "toolsSpec": {
+            "vertexAiSearchSpec": {
+                "dataStoreSpecs": [
+                    {"dataStore": mcp_ds_resource},
+                ]
+            }
+        },
+    }
+
+    info(f"Sending prompt to geapp '{engine_id}' (:streamAssist)...")
+    resp = requests.post(
+        stream_url,
+        headers=de_headers(project_id),
+        json=payload,
+        timeout=120,
+    )
+    if resp.status_code != 200:
+        error(f"streamAssist failed: HTTP {resp.status_code}\n{resp.text}")
+        sys.exit(1)
+
+    chunks = resp.json()
+    if not isinstance(chunks, list):
+        chunks = [chunks]
+
+    text_fragments: list[str] = []
+    thoughts: list[str] = []
+    for chunk in chunks:
+        replies = chunk.get("answer", {}).get("replies", [])
+        for reply in replies:
+            content = reply.get("groundedContent", {}).get("content", {})
+            text = content.get("text", "")
+            if not text:
+                continue
+            if content.get("thought"):
+                thoughts.append(text)
+            else:
+                text_fragments.append(text)
+
+    if thoughts and getattr(args, "verbose", False):
+        header("Assistant Thoughts / Tool Invocations")
+        print("".join(thoughts).strip())
+
+    header("Gemini Enterprise Response")
+    final_answer = "".join(text_fragments).strip()
+    if final_answer:
+        print(final_answer)
+    else:
+        print(json.dumps(chunks, indent=2))
+
+
+# ─── CLI Entrypoint ──────────────────────────────────────────────────────────
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="manage-static-agentgw",
+        description=(
+            "Manage a Gemini Enterprise (geapp) Custom MCP integration with a "
+            "deterministic Static Outbound IP using Agent Gateway and Cloud NAT "
+            "(pure gcloud CLI, no Terraform, no Vertex AI Agent Engine, no Proxy VM)."
+        ),
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        default=os.path.join(_SCRIPT_DIR, "config.yaml"),
+        help="Path to configuration YAML file (default: ./config.yaml)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser(
+        "preflight",
+        help="Validate config.yaml, regional alignment, gcloud auth, org policies, and geapp",
+    )
+    sub.add_parser(
+        "deploy",
+        help="Provision VPC, Cloud NAT Static IP, PSC Attachment, Agent Gateway, Authz, and wire to geapp",
+    )
+    sub.add_parser(
+        "describe",
+        help="Show live status of Static IP, Agent Gateway, Connectivity Template, and geapp MCP connector",
+    )
+    sub.add_parser(
+        "undeploy",
+        help="Tear down the geapp MCP connector, Agent Gateway, Authz policies, and networking via gcloud",
+    )
+
+    send_p = sub.add_parser(
+        "send",
+        help="Send a prompt to the Gemini Enterprise (geapp) assistant (:streamAssist)",
+    )
+    send_p.add_argument("prompt", help="Prompt text to send to the geapp assistant")
+    send_p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print intermediate assistant thoughts and tool invocation traces",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    cfg = load_config(args.config)
+
+    dispatch = {
+        "preflight": cmd_preflight,
+        "deploy": cmd_deploy,
+        "describe": cmd_describe,
+        "undeploy": cmd_undeploy,
+        "send": cmd_send,
+    }
+    dispatch[args.command](cfg, args)
+
+
+if __name__ == "__main__":
+    main()

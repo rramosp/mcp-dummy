@@ -1,7 +1,4 @@
 {
-  "remote_agent_runtime_id": "projects/genai-dev-454121/locations/us-east1/reasoningEngines/5188369971591249920",
-  "deployment_target": "agent_runtime",
-  "is_a2a": true,
-  "agent_directory": "app",
-  "deployment_timestamp": "2026-10-20T23:01:25.644676+00:00"
+  "remote_agent_runtime_id": "None",
+  "deployment_timestamp": "None"
 }

@@ -30,8 +30,8 @@ agent:
   concurrency: 9
 
 mcp_server:
-  # Remote Hello World MCP server endpoint (not deployed here; assumed already running).
-  url: "http://35.186.182.189:8080/mcp"
+  # Remote Hello World MCP server endpoint (HTTPS via sslip.io + Caddy; fallback http://35.186.182.189:8080/mcp).
+  url: "https://mcp.35.186.182.189.sslip.io/mcp"
   transport: "streamable-http"  # "streamable-http" or "sse"
 
 networking:
@@ -44,3 +44,17 @@ networking:
   proxy_port: 8888
   proxy_machine_type: "e2-micro"
   dns_peering_domain: "mcp.internal."
+
+geapp:
+  # Gemini Enterprise App display name ("main test app") or Engine ID ("main-test-app_1784407513868").
+  name: "main test app"
+  # Discovery Engine location for the geapp ("global", "us", or "eu").
+  location: "global"
+  # Agent Gateway & Cloud NAT region (must be "us-central1" for global/us apps, or "europe-west1" for eu apps).
+  gateway_region: "us-central1"
+  # Custom MCP Connector collection ID and display name registered in Gemini Enterprise.
+  connector_id: "hello-mcp-static-agw"
+  connector_display_name: "Hello MCP Static (Agent Gateway)"
+  # Optional Agent Registry MCP server name (used when registering in Agent Registry).
+  mcp_registry_name: "mcp-hello-static"
+
