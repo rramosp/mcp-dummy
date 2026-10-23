@@ -6,7 +6,7 @@ Unlike [`manage-static-agent`](manage-static-agent) (which deploys a Vertex AI A
 - **Uses your existing Gemini Enterprise (`geapp`) instance** specified in [`config.yaml`](config.yaml) (never creates or deletes the `geapp` Engine).
 - **Requires no Vertex AI Agent Engine (`hello-mcp-agent`) and no Egress Proxy VM**—routing is handled natively by **Agent Gateway** (`networkservices.googleapis.com`) paired with an **`AgentConnectivityTemplate` (`vpcEgress: ALL_TRAFFIC`)**, a **PSC Network Attachment**, and **Cloud NAT**.
 - **Uses pure `gcloud` CLI commands** (plus the Discovery Engine REST API initialized with `gcloud auth print-access-token`), with **zero Terraform dependency**.
-- **Provides the same 5 lifecycle subcommands**: `preflight`, `deploy`, `describe`, `send`, and `undeploy`.
+- **Provides 6 lifecycle & guidance subcommands**: `preflight`, `instructions`, `deploy`, `describe`, `send`, and `undeploy`.
 
 ---
 
@@ -197,35 +197,46 @@ geapp:
 
 ### Step 3: Deploy, Inspect, and Test via [`manage-static-agentgw`](manage-static-agentgw)
 
-1. **Run Preflight Checks**:
+1. **Inspect Least-Privilege Permissions, APIs & Manual GCP Console Guide**:
+   Prints the live status (`GRANTED`/`MISSING`/`ENABLED`/`DISABLED`) of all required APIs, strictly scoped least-privilege IAM permissions (avoiding generalist roles like `roles/owner` or `roles/compute.admin`), Google-managed service agents, and org policy constraints, followed by a 7-phase step-by-step manual deployment guide for the GCP Console:
+   ```bash
+   ./manage-static-agentgw instructions
+   # Write the full output as formatted GitHub-Flavored Markdown to a file:
+   ./manage-static-agentgw instructions --output instructions_agw.md
+   # Or view/export only one section:
+   ./manage-static-agentgw instructions --permissions-only
+   ./manage-static-agentgw instructions --guide-only
+   ```
+
+2. **Run Preflight Checks**:
    Validates `gcloud` authentication, regional alignment, HTTPS URL syntax, required APIs, organization policies, and resolves your existing `geapp` Engine:
    ```bash
    ./manage-static-agentgw preflight
    ```
 
-2. **Deploy the Static-IP Agent Gateway & Wire to `geapp`**:
+3. **Deploy the Static-IP Agent Gateway & Wire to `geapp`**:
    Provisions the static IP, VPC/Cloud NAT/PSC Attachment, `AgentConnectivityTemplate` (`ALL_TRAFFIC`), `AgentGateway`, IAP V2 `AuthzExtension`/`AuthzPolicy`, Agent Registry service, IAM v3 `AccessPolicy`/`PolicyBinding`, and links the `REGISTRY_MCP` `DataConnector` to your `geapp`:
    ```bash
    ./manage-static-agentgw deploy
    ```
 
-3. **Describe Live Deployment Status**:
+4. **Describe Live Deployment Status**:
    Displays the reserved **Static Outbound IP** (`35.232.82.164`), PSC attachment endpoint count, Agent Gateway status, and `geapp` connector state:
    ```bash
    ./manage-static-agentgw describe
    ```
 
-4. **Send a Test Prompt to `geapp` (`:streamAssist`)**:
+5. **Send a Test Prompt to `geapp` (`:streamAssist`)**:
    Sends a prompt to the `geapp` assistant targeting the Custom MCP data store (`-v` prints intermediate assistant thoughts/tool traces):
    ```bash
    ./manage-static-agentgw send -v "Call hello_from_ip for Raul and tell me what IP address the MCP server sees"
    ```
    The response will confirm the greeting along with the reserved **Cloud NAT Static IP** (e.g., `35.232.82.164`).
 
-5. **Lock Down the Remote MCP Server Firewall (Optional)**:
+6. **Lock Down the Remote MCP Server Firewall (Optional)**:
    Once verified, you can restrict inbound TCP port `443` on the remote MCP server's firewall strictly to `<STATIC_IP>/32` (as shown in `./manage-static-agentgw describe`) so only traffic egressing through your Agent Gateway + Cloud NAT can reach the MCP server.
 
-6. **Undeploy (Teardown)**:
+7. **Undeploy (Teardown)**:
    Detaches the MCP connector from your `geapp` Engine (leaving the `geapp` Engine itself intact) and deletes the DataConnector collection, IAM v3 bindings, Agent Registry entry, Authz policies, Agent Gateway, Connectivity Template, PSC Attachment, Cloud NAT, Static IP, and VPC:
    ```bash
    ./manage-static-agentgw undeploy

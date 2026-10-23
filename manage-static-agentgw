@@ -26,11 +26,12 @@ Architecture for Static Outbound IP (Agent Gateway + Cloud NAT):
      External IP for every tool invocation triggered by prompts sent to `geapp`.
 
 Subcommands:
-  preflight  Validate config, gcloud auth, org constraints, APIs, and geapp state
-  deploy     Provision VPC/NAT/PSC/Agent Gateway/Authz/Registry and wire to geapp
-  describe   Inspect live status of geapp, MCP connector, Agent Gateway, and Static IP
-  undeploy   Tear down the MCP connector, Agent Gateway, Authz, and networking via gcloud
-  send       Send a prompt to the geapp assistant (:streamAssist) and print the response
+  preflight     Validate config, gcloud auth, org constraints, APIs, and geapp state
+  instructions  Print least-privilege permissions/APIs status and manual GCP Console guide
+  deploy        Provision VPC/NAT/PSC/Agent Gateway/Authz/Registry and wire to geapp
+  describe      Inspect live status of geapp, MCP connector, Agent Gateway, and Static IP
+  undeploy      Tear down the MCP connector, Agent Gateway, Authz, and networking via gcloud
+  send          Send a prompt to the geapp assistant (:streamAssist) and print the response
 """
 
 import os
@@ -1841,7 +1842,7 @@ def cmd_send(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     project_number = get_project_number(project_id)
     mcp_ds_resource = (
         f"projects/{project_number}/locations/{ge_location}"
-        f"/collections/default_collection/dataStores/{d['collection_id']}_mcp_data"
+        f"/collections/default_collection/dataStores/{d['connector_id']}_mcp_data"
     )
     stream_url = (
         f"{de_base_url(ge_location, 'v1alpha')}/projects/{project_id}"
@@ -1900,6 +1901,1367 @@ def cmd_send(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         print(json.dumps(chunks, indent=2))
 
 
+# ─── Subcommand: instructions ────────────────────────────────────────────────
+API_METADATA: list[tuple[str, str, str]] = [
+    (
+        "compute.googleapis.com",
+        "Compute Engine API",
+        "VPC network, PSC subnet, Static External IP, Cloud Router, Cloud NAT, PSC Network Attachment",
+    ),
+    (
+        "discoveryengine.googleapis.com",
+        "Discovery Engine API (Gemini Enterprise)",
+        "Inspect/patch geapp Engine, create/activate Custom MCP DataConnector, invoke :streamAssist",
+    ),
+    (
+        "networkservices.googleapis.com",
+        "Network Services API",
+        "Create/manage AgentConnectivityTemplate (ALL_TRAFFIC) and AgentGateway (AGENT_TO_ANYWHERE)",
+    ),
+    (
+        "networksecurity.googleapis.com",
+        "Network Security API",
+        "Create/manage AuthzPolicy (REQUEST_AUTHZ) attached to the Agent Gateway",
+    ),
+    (
+        "serviceextensions.googleapis.com",
+        "Service Extensions API",
+        "Create/manage IAP V2 AuthzExtension (iap.googleapis.com)",
+    ),
+    (
+        "iap.googleapis.com",
+        "Identity-Aware Proxy API",
+        "Evaluate IAP V2 egress authorization (iap.googleapis.com/resources.egressViaIAP)",
+    ),
+    (
+        "agentregistry.googleapis.com",
+        "Agent Registry API",
+        "Register remote MCP server endpoint and tool schema (services / mcpServers)",
+    ),
+    (
+        "orgpolicy.googleapis.com",
+        "Organization Policy API",
+        "Inspect (and if enforced, override) Custom MCP and IAM v3 policy binding constraints",
+    ),
+    (
+        "cloudresourcemanager.googleapis.com",
+        "Cloud Resource Manager API",
+        "Resolve project number/organization ID and manage project service agent IAM bindings",
+    ),
+]
+
+# Strictly scoped, least-privilege granular permissions required to deploy,
+# inspect, test, and tear down the system (no generalist roles like roles/owner,
+# roles/editor, roles/compute.admin, or roles/iam.securityAdmin).
+LEAST_PRIVILEGE_PERMISSION_GROUPS: list[tuple[str, str, list[tuple[str, str]]]] = [
+    (
+        "1. Project Metadata, API Enablement & Service Identity Setup",
+        "roles/serviceusage.serviceUsageAdmin + roles/resourcemanager.projectIamAdmin (setup only)",
+        [
+            ("resourcemanager.projects.get", "Read project number and organization ancestry"),
+            ("serviceusage.services.list", "Check enabled GCP service APIs (preflight/instructions)"),
+            ("serviceusage.services.enable", "Enable required GCP service APIs (deploy)"),
+            ("serviceusage.services.use", "Provision Google-managed service identities (deploy)"),
+            ("resourcemanager.projects.getIamPolicy", "Inspect project IAM bindings for service agents"),
+            ("resourcemanager.projects.setIamPolicy", "Bind serviceAgent roles (only needed if not pre-bound)"),
+        ],
+    ),
+    (
+        "2. Organization Policy Inspection & Conditional Overrides",
+        "roles/orgpolicy.policyViewer (or roles/orgpolicy.policyAdmin only if policies are enforced)",
+        [
+            ("orgpolicy.policy.get", "Inspect effective org policy constraints (preflight)"),
+            ("orgpolicy.policies.create", "Create project-level org policy override (only if enforced)"),
+            ("orgpolicy.policies.update", "Update project-level org policy override (only if enforced)"),
+        ],
+    ),
+    (
+        "3. VPC, PSC Subnet, Static IP, Cloud NAT & PSC Network Attachment",
+        "roles/compute.networkAdmin (scoped to networking only — NOT roles/compute.admin)",
+        [
+            ("compute.networks.create", "Create custom-mode VPC network"),
+            ("compute.networks.get", "Describe VPC network"),
+            ("compute.networks.updatePolicy", "Attach PSC subnet and Cloud Router to VPC"),
+            ("compute.networks.delete", "Delete VPC network (undeploy)"),
+            ("compute.subnetworks.create", "Create PSC subnet with Private Google Access"),
+            ("compute.subnetworks.get", "Describe PSC subnet"),
+            ("compute.subnetworks.use", "Attach PSC subnet to PSC Network Attachment"),
+            ("compute.subnetworks.delete", "Delete PSC subnet (undeploy)"),
+            ("compute.addresses.create", "Reserve regional Static External IPv4 address"),
+            ("compute.addresses.get", "Read reserved Static External IPv4 address"),
+            ("compute.addresses.use", "Bind reserved Static IP to Cloud NAT gateway"),
+            ("compute.addresses.delete", "Release Static External IPv4 address (undeploy)"),
+            ("compute.routers.create", "Create Cloud Router in gateway region"),
+            ("compute.routers.get", "Describe Cloud Router and Cloud NAT config"),
+            ("compute.routers.update", "Create/update/delete Cloud NAT gateway on Cloud Router"),
+            ("compute.routers.use", "Attach Cloud Router to VPC network"),
+            ("compute.routers.delete", "Delete Cloud Router (undeploy)"),
+            ("compute.networkAttachments.create", "Create ACCEPT_AUTOMATIC PSC Network Attachment"),
+            ("compute.networkAttachments.get", "Describe PSC Network Attachment & connected endpoints"),
+            ("compute.networkAttachments.delete", "Delete PSC Network Attachment (undeploy)"),
+        ],
+    ),
+    (
+        "4. Agent Connectivity Template & Agent Gateway",
+        "roles/agentgateway.admin (scoped to Agent Gateway — NOT roles/networkservices.admin)",
+        [
+            ("networkservices.agentConnectivityTemplates.create", "Create AgentConnectivityTemplate (ALL_TRAFFIC)"),
+            ("networkservices.agentConnectivityTemplates.get", "Describe AgentConnectivityTemplate"),
+            ("networkservices.agentConnectivityTemplates.update", "Update/import AgentConnectivityTemplate"),
+            ("networkservices.agentConnectivityTemplates.delete", "Delete AgentConnectivityTemplate (undeploy)"),
+            ("networkservices.agentGateways.create", "Create AGENT_TO_ANYWHERE MCP Agent Gateway"),
+            ("networkservices.agentGateways.get", "Describe Agent Gateway"),
+            ("networkservices.agentGateways.update", "Update/import Agent Gateway"),
+            ("networkservices.agentGateways.delete", "Delete Agent Gateway (undeploy)"),
+        ],
+    ),
+    (
+        "5. Service Extensions IAP V2 AuthzExtension",
+        "roles/serviceextensions.admin (or custom role with authzExtensions.* only)",
+        [
+            ("serviceextensions.authzExtensions.create", "Create IAP V2 AuthzExtension (iap.googleapis.com)"),
+            ("serviceextensions.authzExtensions.get", "Describe AuthzExtension"),
+            ("serviceextensions.authzExtensions.update", "Update/import AuthzExtension"),
+            ("serviceextensions.authzExtensions.delete", "Delete AuthzExtension (undeploy)"),
+        ],
+    ),
+    (
+        "6. Network Security AuthzPolicy",
+        "roles/networksecurity.authzPolicyAdmin (scoped to AuthzPolicy only)",
+        [
+            ("networksecurity.authzPolicies.create", "Create REQUEST_AUTHZ AuthzPolicy targeting Gateway"),
+            ("networksecurity.authzPolicies.get", "Describe AuthzPolicy"),
+            ("networksecurity.authzPolicies.update", "Update/import AuthzPolicy"),
+            ("networksecurity.authzPolicies.delete", "Delete AuthzPolicy (undeploy)"),
+        ],
+    ),
+    (
+        "7. Agent Registry MCP Server Catalog",
+        "roles/agentregistry.admin (scoped to Agent Registry services & MCP servers)",
+        [
+            ("agentregistry.services.create", "Register remote MCP server URL & tool-spec schema"),
+            ("agentregistry.services.get", "Describe Agent Registry service"),
+            ("agentregistry.services.update", "Update Agent Registry service URL & tool-spec"),
+            ("agentregistry.services.delete", "Delete Agent Registry service (undeploy)"),
+            ("agentregistry.mcpServers.list", "List projected McpServer resources"),
+            ("agentregistry.mcpServers.get", "Describe projected McpServer resource"),
+        ],
+    ),
+    (
+        "8. IAM v3 Unified Access Policy & Policy Binding (IAP Egress)",
+        "Custom role / IAM v3 AccessPolicy & PolicyBinding permissions (NOT roles/iam.securityAdmin)",
+        [
+            ("iam.accessPolicies.create", "Create IAM v3 AccessPolicy (iap.googleapis.com/resources.egressViaIAP)"),
+            ("iam.accessPolicies.get", "Describe IAM v3 AccessPolicy"),
+            ("iam.accessPolicies.update", "Update IAM v3 AccessPolicy"),
+            ("iam.accessPolicies.delete", "Delete IAM v3 AccessPolicy (undeploy)"),
+            ("iam.policyBindings.create", "Bind IAM v3 AccessPolicy to target GCP project"),
+            ("iam.policyBindings.get", "Describe IAM v3 PolicyBinding"),
+            ("iam.policyBindings.delete", "Delete IAM v3 PolicyBinding (undeploy)"),
+        ],
+    ),
+    (
+        "9. Gemini Enterprise (Discovery Engine) App, Custom MCP Connector & Assistant",
+        "roles/discoveryengine.admin (scoped to Discovery Engine only)",
+        [
+            ("discoveryengine.engines.get", "Describe existing geapp Engine"),
+            ("discoveryengine.engines.list", "Resolve geapp Engine by display name"),
+            ("discoveryengine.engines.update", "Patch defaultEgressAgentGateway and dataStoreIds on Engine"),
+            ("discoveryengine.collections.create", "Create collection for Custom MCP connector"),
+            ("discoveryengine.collections.get", "Describe Custom MCP collection"),
+            ("discoveryengine.collections.delete", "Delete Custom MCP collection (undeploy)"),
+            ("discoveryengine.dataConnectors.create", "Provision custom_mcp DataConnector (:setUpDataConnector)"),
+            ("discoveryengine.dataConnectors.get", "Describe custom_mcp DataConnector state"),
+            ("discoveryengine.dataConnectors.update", "Activate actionConfig (use_agent_gateway_egress=true)"),
+            ("discoveryengine.dataStores.get", "Inspect _mcp_data store attached to Engine"),
+            ("discoveryengine.assistants.get", "Send test prompts via default_assistant:streamAssist (send)"),
+        ],
+    ),
+]
+
+ORG_POLICY_CONSTRAINTS: list[tuple[str, str]] = [
+    (
+        "iam.managed.disableAccessPolicyBinding",
+        "Must be NOT enforced (enforce: false) so IAM v3 PolicyBinding can attach the IAP AccessPolicy to the project",
+    ),
+    (
+        "discoveryengine.SkipCustomMcpRestriction",
+        "Must be NOT enforced (enforce: false) to allow Custom MCP connectors in Gemini Enterprise",
+    ),
+    (
+        "discoveryengine.managed.disableCustomMcpServerConnector",
+        "Must be NOT enforced (enforce: false) to allow creating custom_mcp DataConnectors",
+    ),
+    (
+        "discoveryengine.managed.allowedEgressFqdns",
+        "Must be NOT enforced (or explicitly allow the mcp.<IP>.sslip.io FQDN) for outbound MCP egress",
+    ),
+    (
+        "discoveryengine.managed.allowedDataSources",
+        "Must be NOT enforced (or explicitly allow custom_mcp) in Discovery Engine",
+    ),
+]
+
+
+def _try_get_access_token() -> str:
+    """Attempt to obtain a gcloud access token without exiting on failure."""
+    token = gcloud_value(["auth", "print-access-token"])
+    if token:
+        return token
+    return gcloud_value(["auth", "application-default", "print-access-token"])
+
+
+def _test_iam_permissions_batch(
+    project_id: str, token: str, perms: list[str]
+) -> tuple[set[str], set[str]]:
+    """Test a list of IAM permissions via Cloud Resource Manager projects:testIamPermissions.
+
+    If a batch contains a preview/v3 permission that the v1 projects:testIamPermissions
+    endpoint rejects with HTTP 400, recursively bisects the batch so all supported
+    permissions are still accurately evaluated and unsupported ones are returned in
+    `untestable`.
+    """
+    if not perms:
+        return set(), set()
+
+    url = f"https://cloudresourcemanager.googleapis.com/v1/projects/{project_id}:testIamPermissions"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(
+            url, headers=headers, json={"permissions": perms}, timeout=20
+        )
+    except Exception:
+        return set(), set(perms)
+
+    if resp.status_code == 200:
+        granted = set(resp.json().get("permissions", []))
+        return granted, set()
+
+    if resp.status_code == 400:
+        # Check if the error message names a specific invalid permission
+        try:
+            err_msg = resp.json().get("error", {}).get("message", "")
+        except Exception:
+            err_msg = resp.text
+        m = re.search(r"Permission ([a-zA-Z0-9_.]+) is not valid", err_msg)
+        if m and m.group(1) in perms:
+            bad_perm = m.group(1)
+            remaining = [p for p in perms if p != bad_perm]
+            granted, untestable = _test_iam_permissions_batch(
+                project_id, token, remaining
+            )
+            untestable.add(bad_perm)
+            return granted, untestable
+
+        if len(perms) == 1:
+            return set(), {perms[0]}
+        mid = len(perms) // 2
+        g1, u1 = _test_iam_permissions_batch(project_id, token, perms[:mid])
+        g2, u2 = _test_iam_permissions_batch(project_id, token, perms[mid:])
+        return g1 | g2, u1 | u2
+
+    return set(), set(perms)
+
+
+def _render_instructions_markdown(
+    *,
+    project_id: str,
+    disp_proj_num: str,
+    disp_org_id: str,
+    active_account: str,
+    auth_ok: bool,
+    region: str,
+    ge_location: str,
+    geapp_name: str,
+    engine_id: str,
+    mcp_url: str,
+    psc_cidr: str,
+    disp_static_ip: str,
+    d: dict[str, str],
+    show_perms: bool,
+    show_guide: bool,
+    api_rows: list[tuple[str, str, str, str]],
+    perm_group_rows: list[tuple[str, str, list[tuple[str, str, str]]]],
+    granted_count: int,
+    missing_count: int,
+    unverified_count: int,
+    all_perms: list[str],
+    sa_rows: list[tuple[str, str, str, str]],
+    spiffe_row: tuple[str, str, str],
+    org_policy_rows: list[tuple[str, str, str]],
+) -> str:
+    """Render the complete `instructions` output as a clean GitHub-Flavored Markdown document."""
+    lines: list[str] = [
+        "# Gemini Enterprise (`geapp`) Static Outbound IP via Agent Gateway — Permissions & Manual Deployment Guide",
+        "",
+        f"- **Target Project:** `{project_id}` (projectNumber: `{disp_proj_num}`, orgId: `{disp_org_id}`)",
+        f"- **Active Principal:** `{active_account or 'None'}`",
+        f"- **Auth Token Status:** `{'AUTHENTICATED' if auth_ok else 'REAUTH REQUIRED (gcloud auth login)'}`",
+        f"- **Gateway & Cloud NAT Region:** `{region}` (paired with `geapp` location: `{ge_location}`)",
+        f"- **Gemini Enterprise App (`geapp`):** `{geapp_name}` (Engine ID: `{engine_id}`)",
+        f"- **Remote MCP Endpoint:** `{mcp_url}`",
+        f"- **Reserved Static Outbound IP:** `{disp_static_ip}` (`{d['nat_ip_name']}`)",
+        "",
+    ]
+
+    if not auth_ok:
+        lines.extend(
+            [
+                "> [!WARNING]",
+                f"> `gcloud` credentials for `{active_account or 'default'}` require re-authentication (`gcloud auth login`). Live GCP status checks below show `UNVERIFIED` until you re-authenticate.",
+                "",
+            ]
+        )
+
+    if show_perms:
+        lines.extend(
+            [
+                "---",
+                "",
+                "## Part 1: Least-Privilege Permissions, APIs, Service Agents & Org Policies (Live Status)",
+                "",
+                f"### 1A. Required GCP Service APIs ({len(api_rows)} APIs)",
+                "",
+                "| API Service Name | Title | Status | Purpose |",
+                "| :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for api_name, title, status_label, purpose in api_rows:
+            lines.append(f"| `{api_name}` | {title} | **{status_label}** | {purpose} |")
+
+        lines.extend(
+            [
+                "",
+                "### 1B. Least-Privilege Deployer IAM Permissions (Granular — Avoid Generalist Roles)",
+                "",
+                "> **Security Principle:** Do **not** grant generalist roles such as `roles/owner`, `roles/editor`, `roles/compute.admin`, `roles/networkservices.admin`, or `roles/iam.securityAdmin`. Below is the minimal set of granular permissions required across each component and their current status for your active account.",
+                "",
+            ]
+        )
+
+        for group_title, role_hint, rows in perm_group_rows:
+            lines.extend(
+                [
+                    f"#### {group_title}",
+                    "",
+                    f"- **Restrictive Predefined Role Alternative:** `{role_hint}`",
+                    "",
+                    "| Permission | Status | Scope / Operation |",
+                    "| :--- | :--- | :--- |",
+                ]
+            )
+            for perm, status_label, desc in rows:
+                lines.append(f"| `{perm}` | **{status_label}** | {desc} |")
+            lines.append("")
+
+        custom_role_perms = ",".join(all_perms)
+        lines.extend(
+            [
+                f"**Deployer Permission Summary:** **{granted_count} granted** | **{missing_count} missing** | **{unverified_count} unverified** (Total: {len(all_perms)} permissions)",
+                "",
+                "#### Least-Privilege Custom Role Command (Recommended over Predefined Roles)",
+                "",
+                "```bash",
+                "gcloud iam roles create staticAgentGatewayDeployer \\",
+                f"  --project={project_id} \\",
+                '  --title="Static IP Agent Gateway & MCP Deployer" \\',
+                '  --description="Least-privilege role to deploy Agent Gateway + Cloud NAT static IP for Gemini Enterprise MCP" \\',
+                f'  --permissions="{custom_role_perms}"',
+                "",
+                f"gcloud projects add-iam-policy-binding {project_id} \\",
+                f'  --member="user:{active_account or "<YOUR_EMAIL>"}" \\',
+                f'  --role="projects/{project_id}/roles/staticAgentGatewayDeployer"',
+                "```",
+                "",
+                "### 1C. Required Google-Managed Service Agent & Runtime SPIFFE Bindings",
+                "",
+                "| Service Agent / Principal | Role / Permission | Status | Purpose |",
+                "| :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for short_member, role, st_label, purpose in sa_rows:
+            lines.append(f"| `{short_member}` | `{role}` | **{st_label}** | {purpose} |")
+        spiffe_label, spiffe_perm, spiffe_st_label = spiffe_row
+        lines.append(
+            f"| `{spiffe_label}` | `{spiffe_perm}` | **{spiffe_st_label}** | Authorizes the `geapp` `default_assistant` workload identity to egress via IAP V2 to registered MCP servers |"
+        )
+
+        lines.extend(
+            [
+                "",
+                "### 1D. Organization Policy Constraints (Must Not Block Custom MCP or IAM v3)",
+                "",
+                "| Constraint Name | Current Status | Requirement |",
+                "| :--- | :--- | :--- |",
+            ]
+        )
+        for constraint, st_label, req_desc in org_policy_rows:
+            lines.append(f"| `{constraint}` | **{st_label}** | {req_desc} |")
+        lines.append("")
+
+    if show_guide:
+        lines.extend(
+            [
+                "---",
+                "",
+                "## Part 2: Step-by-Step Manual Deployment Guide Using the GCP Console",
+                "",
+                f"This guide walks through manually deploying the complete Static Outbound IP Agent Gateway architecture in the Google Cloud Console using the exact settings from your configuration file (`project={project_id}`, `gateway_region={region}`, `geapp={geapp_name}`).",
+                "",
+                "### Phase 1: Enable APIs, Verify Service Agents & Check Org Policies",
+                "",
+                "1. **Enable Required APIs (`APIs & Services > Library`)**",
+                f"   - Open: <https://console.cloud.google.com/apis/library?project={project_id}>",
+                "   - Search for and click **Enable** on each of the following APIs:",
+                "     - Compute Engine API (`compute.googleapis.com`)",
+                "     - Discovery Engine API (`discoveryengine.googleapis.com`)",
+                "     - Network Services API (`networkservices.googleapis.com`)",
+                "     - Network Security API (`networksecurity.googleapis.com`)",
+                "     - Service Extensions API (`serviceextensions.googleapis.com`)",
+                "     - Identity-Aware Proxy API (`iap.googleapis.com`)",
+                "     - Agent Registry API (`agentregistry.googleapis.com`)",
+                "     - Organization Policy API (`orgpolicy.googleapis.com`)",
+                "     - Cloud Resource Manager API (`cloudresourcemanager.googleapis.com`)",
+                "",
+                "2. **Grant Google-Managed Service Agent Roles (`IAM & Admin > IAM`)**",
+                f"   - Open: <https://console.cloud.google.com/iam-admin/iam?project={project_id}>",
+                '   - Check **"Include Google-provided role grants"** at the top right of the IAM table.',
+                "   - Click **Grant Access** to add any missing service agent role bindings:",
+                f"     - Principal: `service-{disp_proj_num}@gcp-sa-discoveryengine.iam.gserviceaccount.com`",
+                "       - Roles: `Discovery Engine Service Agent` (`roles/discoveryengine.serviceAgent`), `Agent Registry Temp Service Agent` (`roles/agentregistry.TempServiceAgent`)",
+                f"     - Principal: `service-{disp_proj_num}@gcp-sa-agentgateway.iam.gserviceaccount.com`",
+                "       - Role: `Agent Gateway Service Agent` (`roles/agentgateway.serviceAgent`)",
+                f"     - Principal: `service-{disp_proj_num}@gcp-sa-networkservices.iam.gserviceaccount.com`",
+                "       - Role: `Network Services Service Agent` (`roles/networkservices.serviceAgent`)",
+                f"     - Principal: `service-{disp_proj_num}@gcp-sa-iap.iam.gserviceaccount.com`",
+                "       - Role: `IAP Egress Service Agent` (`roles/iap.egressServiceAgent`)",
+                "   - *Note:* If a service agent email does not exist yet, initialize it once in Cloud Shell:",
+                f"     `gcloud beta services identity create --service=<api>.googleapis.com --project={project_id}`",
+                "",
+                "3. **Verify Organization Policies (`IAM & Admin > Organization Policies`)**",
+                f"   - Open: <https://console.cloud.google.com/iam-admin/orgpolicies/list?project={project_id}>",
+                "   - Filter for each constraint below; if any is enforced, click it -> **Manage policy** -> **Override parent's policy** -> set Enforcement to **Off** (`enforce: false`) -> **Set policy**:",
+                "     - `iam.managed.disableAccessPolicyBinding`",
+                "     - `discoveryengine.SkipCustomMcpRestriction`",
+                "     - `discoveryengine.managed.disableCustomMcpServerConnector`",
+                "     - `discoveryengine.managed.allowedEgressFqdns`",
+                "     - `discoveryengine.managed.allowedDataSources`",
+                "",
+                "### Phase 2: Create VPC, PSC Subnet, Static External IP, Cloud NAT & PSC Attachment",
+                "",
+                f"> **Important Regional Alignment:** Because your Gemini Enterprise app is in `{ge_location}`, **all** networking and Agent Gateway resources **must** be created in `{region}`.",
+                "",
+                "1. **Create Custom VPC Network & PSC Subnet (`VPC network > VPC networks`)**",
+                f"   - Open: <https://console.cloud.google.com/networking/networks/add?project={project_id}>",
+                f"   - **Name:** `{d['vpc_name']}`",
+                "   - **Subnet creation mode:** Select **Custom**",
+                "   - Under **New subnet**, configure:",
+                f"     - **Name:** `{d['psc_subnet_name']}`",
+                f"     - **Region:** `{region}`",
+                "     - **IP stack type:** `IPv4 (single-stack)`",
+                f"     - **IPv4 range:** `{psc_cidr}` (must be `/28` or larger for PSC Network Attachment)",
+                "     - **Private Google Access:** Select **On**",
+                "   - Click **Done** on the subnet, leave firewall rules unchecked, and click **Create**.",
+                "",
+                "2. **Reserve Regional Static External IPv4 Address (`VPC network > IP addresses`)**",
+                f"   - Open: <https://console.cloud.google.com/networking/addresses/add?project={project_id}>",
+                f"   - **Name:** `{d['nat_ip_name']}`",
+                "   - **Network Service Tier:** `Premium`",
+                "   - **IP version:** `IPv4`",
+                "   - **Type:** `Regional`",
+                f"   - **Region:** `{region}`",
+                "   - **Attached to:** `None` (will be assigned to Cloud NAT in the next step)",
+                f"   - Click **Reserve** and copy the allocated IPv4 address (`{disp_static_ip}`).",
+                "",
+                "3. **Create Cloud Router & Cloud NAT Gateway (`Network Services > Cloud NAT`)**",
+                f"   - Open: <https://console.cloud.google.com/net-services/nat/add?project={project_id}>",
+                f"   - **Gateway name:** `{d['nat_name']}`",
+                "   - **NAT type:** `Public`",
+                "   - **Cloud Router:**",
+                f"     - **Network:** `{d['vpc_name']}`",
+                f"     - **Region:** `{region}`",
+                f"     - Select **Create new router** -> Name: `{d['router_name']}` -> click **Create**",
+                "   - **Cloud NAT mapping:** `All subnets (primary and secondary IP ranges)`",
+                "   - **Cloud NAT IP addresses:**",
+                "     - Select **Manual** (do **not** use Automatic or traffic will use ephemeral IPs)",
+                f"     - **IP address 1:** Select `{d['nat_ip_name']}` (`{disp_static_ip}`)",
+                "   - Expand **Advanced configurations** -> under **Logging**, select **Translation and errors**.",
+                "   - Click **Create**.",
+                "",
+                "4. **Create PSC Network Attachment (`Network Services > Private Service Connect`)**",
+                f"   - Open: <https://console.cloud.google.com/net-services/psc/list?tab=networkAttachments&project={project_id}>",
+                "   - Click **Create network attachment**:",
+                f"     - **Name:** `{d['attachment_name']}`",
+                f"     - **Region:** `{region}`",
+                f"     - **Network:** `{d['vpc_name']}`",
+                f"     - **Subnetworks:** Select `{d['psc_subnet_name']}`",
+                "     - **Connection preference:** Select **Accept connections automatically (Accept all)**",
+                "   - Click **Create**.",
+                "",
+                "### Phase 3: Register the Remote MCP Server in Agent Registry",
+                "",
+                "1. **Verify Remote MCP Server HTTPS Endpoint**",
+                f"   - Ensure your MCP server is running behind HTTPS with a publicly trusted CA certificate at `{mcp_url}` (Agent Gateway's Secure Web Proxy uses TLS SNI inspection and rejects plain HTTP or bare IP URLs with HTTP 404 `default_denied`).",
+                "",
+                "2. **Create Agent Registry Service Entry**",
+                "   - Open Agent Registry in the Console (or click the **Activate Cloud Shell** `>_` icon in the top-right Console toolbar):",
+                f"     - **Location:** `{region}`",
+                f"     - **Service ID:** `{d['mcp_reg_name']}`",
+                f"     - **Display Name:** `{d['connector_display_name']}`",
+                "     - **Protocol Binding:** `JSONRPC`",
+                f"     - **Endpoint URL:** `{mcp_url}`",
+                "     - **MCP Tool Spec:** JSON schema defining `hello` and `hello_from_ip`",
+                "",
+                "```bash",
+                "cat <<'EOF' > /tmp/toolspec.json",
+                json.dumps(DEFAULT_MCP_TOOLS_SPEC, indent=2),
+                "EOF",
+                f"gcloud agent-registry services create {d['mcp_reg_name']} \\",
+                f"  --location={region} \\",
+                f'  --display-name="{d["connector_display_name"]}" \\',
+                f'  --interfaces="protocolBinding=JSONRPC,url={mcp_url}" \\',
+                "  --mcp-server-spec-type=tool-spec \\",
+                "  --mcp-server-spec-content=/tmp/toolspec.json \\",
+                f"  --project={project_id}",
+                "```",
+                "",
+                "### Phase 4: Provision AgentConnectivityTemplate (`ALL_TRAFFIC`) & Agent Gateway",
+                "",
+                "1. **Create the `AgentConnectivityTemplate` (`vpcEgress: ALL_TRAFFIC`)**",
+                "   - Navigate to **Network Services > Agent Gateway** (or run the YAML import in **Cloud Shell**):",
+                f"     - **Name:** `{d['act_name']}` (Location: `{region}`)",
+                "     - **Access Path:** `AGENT_TO_ANYWHERE`",
+                "     - **Deployment Model:** `CENTRALIZED`",
+                f"     - **Network Attachment:** `projects/{project_id}/regions/{region}/networkAttachments/{d['attachment_name']}`",
+                "     - **VPC Egress:** `ALL_TRAFFIC` (routes all public internet MCP calls into your PSC subnet)",
+                "",
+                "```bash",
+                "cat <<'EOF' > /tmp/act.yaml",
+                "accessPath: AGENT_TO_ANYWHERE",
+                f"name: projects/{disp_proj_num}/locations/{region}/agentConnectivityTemplates/{d['act_name']}",
+                "deploymentModel: CENTRALIZED",
+                "egressNetworkConfig:",
+                f"  networkAttachment: projects/{project_id}/regions/{region}/networkAttachments/{d['attachment_name']}",
+                "  vpcEgress: ALL_TRAFFIC",
+                "EOF",
+                f"gcloud alpha network-services agent-connectivity-templates import {d['act_name']} \\",
+                f"  --location={region} --source=/tmp/act.yaml --project={project_id}",
+                "```",
+                "",
+                "2. **Create the `AgentGateway` (`AGENT_TO_ANYWHERE`)**",
+                f"   - Configure the Agent Gateway in `{region}` linked to the Connectivity Template and Registry:",
+                "",
+                "```bash",
+                "cat <<'EOF' > /tmp/agw.yaml",
+                f"name: {d['agw_name']}",
+                "protocols:",
+                "  - MCP",
+                "googleManaged:",
+                "  governedAccessPath: AGENT_TO_ANYWHERE",
+                f"agentConnectivityTemplate: projects/{disp_proj_num}/locations/{region}/agentConnectivityTemplates/{d['act_name']}",
+                "registries:",
+                f"  - //agentregistry.googleapis.com/projects/{project_id}/locations/{region}",
+                "EOF",
+                f"gcloud alpha network-services agent-gateways import {d['agw_name']} \\",
+                f"  --location={region} --source=/tmp/agw.yaml --project={project_id}",
+                "```",
+                "",
+                "### Phase 5: Configure IAP V2 AuthzExtension, AuthzPolicy & IAM v3 Access Policy",
+                "",
+                "1. **Create the Service Extensions `AuthzExtension` (`Network Services > Service Extensions`)**",
+                f"   - Open: <https://console.cloud.google.com/net-services/service-extensions/list?project={project_id}>",
+                f"   - **Name:** `{d['authz_ext_name']}` | **Region:** `{region}`",
+                "   - **Service:** `iap.googleapis.com` | **Fail Open:** `false` | **Timeout:** `1s` | **Metadata:** `iapPolicyVersion: V2`",
+                "",
+                "```bash",
+                "cat <<'EOF' > /tmp/authz-ext.yaml",
+                f"name: {d['authz_ext_name']}",
+                "service: iap.googleapis.com",
+                "failOpen: false",
+                "timeout: 1s",
+                "metadata:",
+                "  iapPolicyVersion: V2",
+                "EOF",
+                f"gcloud service-extensions authz-extensions import {d['authz_ext_name']} \\",
+                f"  --location={region} --source=/tmp/authz-ext.yaml --project={project_id}",
+                "```",
+                "",
+                "2. **Create the Network Security `AuthzPolicy` (`Network Security > Authorization Policies`)**",
+                f"   - Open: <https://console.cloud.google.com/net-security/authz-policies/list?project={project_id}>",
+                f"   - **Name:** `{d['authz_policy_name']}` | **Region:** `{region}`",
+                f"   - **Target Resource:** `projects/{project_id}/locations/{region}/agentGateways/{d['agw_name']}`",
+                "   - **Policy Profile:** `REQUEST_AUTHZ` | **Action:** `CUSTOM`",
+                f"   - **AuthzExtension:** `projects/{project_id}/locations/{region}/authzExtensions/{d['authz_ext_name']}`",
+                "",
+                "```bash",
+                "cat <<'EOF' > /tmp/authz-policy.yaml",
+                f"name: {d['authz_policy_name']}",
+                "target:",
+                "  resources:",
+                f"    - projects/{project_id}/locations/{region}/agentGateways/{d['agw_name']}",
+                "policyProfile: REQUEST_AUTHZ",
+                "action: CUSTOM",
+                "customProvider:",
+                "  authzExtension:",
+                "    resources:",
+                f"      - projects/{project_id}/locations/{region}/authzExtensions/{d['authz_ext_name']}",
+                "EOF",
+                f"gcloud network-security authz-policies import {d['authz_policy_name']} \\",
+                f"  --location={region} --source=/tmp/authz-policy.yaml --project={project_id}",
+                "```",
+                "",
+                "3. **Create IAM v3 `AccessPolicy` & `PolicyBinding` for the `geapp` SPIFFE Identity**",
+                "   - Authorize your Gemini Enterprise `default_assistant` workload identity to egress via IAP to any MCP service registered in Agent Registry (`destination.is_registered == true`):",
+                "",
+                "```bash",
+                "cat <<'EOF' > /tmp/iap_rules.json",
+                "[",
+                "  {",
+                f'    "description": "allow geapp {engine_id} assistant to any registered service",',
+                '    "effect": "ALLOW",',
+                '    "principals": [',
+                f'      "principal://agents.global.org-{disp_org_id}.system.id.goog/resources/discoveryengine/projects/{disp_proj_num}/locations/{ge_location}/engines/{engine_id}/assistants/default_assistant/agents/default/core_assistant",',
+                f'      "principal://agents.global.org-{disp_org_id}.system.id.goog/resources/aiplatform/projects/{disp_proj_num}/locations/{ge_location}/collections/default_collection/engines/{engine_id}/assistants/default_assistant"',
+                "    ],",
+                '    "operation": {"permissions": ["iap.googleapis.com/resources.egressViaIAP"]},',
+                '    "conditions": {"iap.googleapis.com": {"expression": "destination.is_registered == true"}}',
+                "  }",
+                "]",
+                "EOF",
+                f"gcloud iam access-policies create {d['iap_policy_name']} \\",
+                f"  --location=global --display-name={d['iap_policy_name']} \\",
+                f"  --details-rules=/tmp/iap_rules.json --project={project_id}",
+                f"gcloud iam policy-bindings create {d['iap_binding_name']} \\",
+                "  --location=global \\",
+                f'  --policy="projects/{project_id}/locations/global/accessPolicies/{d["iap_policy_name"]}" \\',
+                f'  --target-resource="//cloudresourcemanager.googleapis.com/projects/{project_id}" \\',
+                f"  --project={project_id}",
+                "```",
+                "",
+                "### Phase 6: Wire Agent Gateway & Custom MCP Connector in Gemini Enterprise Console",
+                "",
+                "1. **Bind Default Egress Agent Gateway to the Gemini Enterprise App**",
+                f"   - Open: <https://console.cloud.google.com/gen-app-builder/engines?project={project_id}>",
+                f"   - Select your existing Gemini Enterprise App: `{geapp_name}` (Engine ID: `{engine_id}`, Location: `{ge_location}`).",
+                "   - In **App Settings > Agent Gateway / Egress**, set **Default Egress Agent Gateway** to:",
+                f"     `projects/{project_id}/locations/{region}/agentGateways/{d['agw_name']}`",
+                "",
+                "2. **Create & Activate the Custom MCP Connector (`REGISTRY_MCP`)**",
+                f"   - Open: <https://console.cloud.google.com/gen-app-builder/data-stores?project={project_id}>",
+                "   - Click **Create Data Store / Add Connector** -> select **Custom MCP Server (`custom_mcp`)**:",
+                f"     - **Location:** `{ge_location}`",
+                f"     - **Collection / Connector ID:** `{d['connector_id']}`",
+                f"     - **Display Name:** `{d['connector_display_name']}`",
+                "     - **Connector Mode:** `FEDERATED` (Entity: `mcp_data`)",
+                "     - **MCP Server Source:** `REGISTRY_MCP`",
+                f"     - **Registry MCP Server Name:** `projects/{project_id}/locations/{region}/mcpServers/<MCP_SERVER_ID>`",
+                f"     - **Instance URI:** `{mcp_url}`",
+                "     - **Auth Type:** `NO_AUTH`",
+                "     - **Use Agent Gateway Egress (`use_agent_gateway_egress`):** `true` (Enabled)",
+                f"     - **Agent Gateway Engine:** `projects/{project_id}/locations/{ge_location}/collections/default_collection/engines/{engine_id}`",
+                f"   - Attach the resulting `{d['connector_id']}_mcp_data` Data Store to your `{engine_id}` App (and detach any older non-Agent-Gateway MCP Data Stores targeting `{mcp_url}`).",
+                "",
+                "### Phase 7: Verify Static Outbound IP in Console Preview & Cloud Logging",
+                "",
+                "1. **Test from Gemini Enterprise Web App / Console Preview**",
+                f"   - Open your `{geapp_name}` app preview in the Console and ask:",
+                "     `Call hello_from_ip for Raul and tell me what IP address the MCP server sees`",
+                f"   - Confirm that the returned IP address matches your reserved Cloud NAT Static IP: **`{disp_static_ip}`**",
+                "",
+                "2. **Verify Egress & SNAT in Cloud Logging (`Logs Explorer`)**",
+                f"   - Open: <https://console.cloud.google.com/logs/query?project={project_id}>",
+                "   - **Agent Gateway & IAP Authz trace query:**",
+                f'     `resource.type="networkservices.googleapis.com/Gateway" AND resource.labels.location="{region}"`',
+                "   - **Cloud NAT Static IP translation query:**",
+                f'     `resource.type="nat_gateway" AND resource.labels.gateway_name="{d["nat_name"]}"`',
+                "",
+                "3. **Lock Down the Remote MCP Server Firewall (Recommended)**",
+                f"   - Restrict inbound TCP port `443` on your remote MCP server firewall to source CIDR `{disp_static_ip}/32` so only requests routed through your Agent Gateway + Cloud NAT can reach the MCP server.",
+                "",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def cmd_instructions(cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    """Print least-privilege permissions/APIs/policies with live status and a step-by-step GCP Console guide."""
+    project_id = cfg["gcp"]["project_id"]
+    mcp_url = cfg["mcp_server"]["url"]
+    psc_cidr = cfg["networking"]["psc_subnet_cidr"]
+    geapp_name = cfg["geapp"]["name"]
+    d = cfg["_derived"]
+    region = d["agw_region"]
+    ge_location = d["ge_location"]
+
+    show_perms = not getattr(args, "guide_only", False)
+    show_guide = not getattr(args, "permissions_only", False)
+    output_path: str | None = getattr(args, "output", None)
+
+    active_account = gcloud_value(["config", "get-value", "account"])
+    token = _try_get_access_token()
+    auth_ok = bool(token)
+
+    project_number = (
+        gcloud_value(["projects", "describe", project_id, "--format=value(projectNumber)"])
+        if auth_ok
+        else ""
+    )
+    org_id = get_org_id(project_id) if auth_ok else ""
+    engine = (
+        resolve_geapp_engine(project_id, ge_location, geapp_name)
+        if auth_ok
+        else None
+    )
+    engine_id = (
+        engine["name"].split("/")[-1]
+        if engine and engine.get("name")
+        else (geapp_name if " " not in geapp_name else "<ENGINE_ID>")
+    )
+    disp_proj_num = project_number or "<PROJECT_NUMBER>"
+    disp_org_id = org_id or "<ORG_ID>"
+
+    addr = (
+        gcloud_json(
+            ["compute", "addresses", "describe", d["nat_ip_name"], f"--region={region}"],
+            project_id,
+        )
+        if auth_ok
+        else None
+    )
+    live_static_ip = (addr or {}).get("address", "")
+    disp_static_ip = live_static_ip or "<RESERVED_STATIC_IP>"
+
+    if not auth_ok:
+        warn(
+            f"gcloud credentials for '{active_account or 'default'}' require re-authentication "
+            "(`gcloud auth login`). Live GCP status checks below will show UNVERIFIED until you "
+            "re-authenticate."
+        )
+
+    # Pre-collect Part 1 status data so both terminal output and --output <file.md> share it
+    api_rows: list[tuple[str, str, str, str]] = []
+    perm_group_rows: list[tuple[str, str, list[tuple[str, str, str]]]] = []
+    all_perms: list[str] = [
+        perm
+        for _grp, _role_hint, items in LEAST_PRIVILEGE_PERMISSION_GROUPS
+        for perm, _desc in items
+    ]
+    granted_count = 0
+    missing_count = 0
+    unverified_count = 0
+    sa_rows: list[tuple[str, str, str, str]] = []
+    spiffe_row: tuple[str, str, str] = (
+        f"SPIFFE: .../engines/{engine_id}/.../core_assistant",
+        "iap.googleapis.com/resources.egressViaIAP",
+        "UNVERIFIED",
+    )
+    org_policy_rows: list[tuple[str, str, str]] = []
+
+    if show_perms:
+        # 1A. APIs
+        enabled_services: set[str] = set()
+        if auth_ok:
+            raw_svcs = gcloud_value(
+                ["services", "list", "--enabled", "--format=value(config.name)"],
+                project_id=project_id,
+            )
+            enabled_services = set(raw_svcs.splitlines())
+
+        for api_name, title, purpose in API_METADATA:
+            if not auth_ok:
+                st_label = "UNVERIFIED"
+            elif api_name in enabled_services:
+                st_label = "ENABLED"
+            else:
+                st_label = "DISABLED"
+            api_rows.append((api_name, title, st_label, purpose))
+
+        # 1B. Granular IAM Permissions
+        granted_perms: set[str] = set()
+        untestable_perms: set[str] = set()
+        user_roles_on_project: set[str] = set()
+        iam_policy: dict[str, Any] | None = None
+
+        if auth_ok:
+            granted_perms, untestable_perms = _test_iam_permissions_batch(
+                project_id, token, all_perms
+            )
+            iam_policy = gcloud_json(["projects", "get-iam-policy", project_id])
+            if iam_policy and active_account:
+                for binding in iam_policy.get("bindings", []):
+                    role = binding.get("role", "")
+                    for member in binding.get("members", []):
+                        if active_account in member:
+                            user_roles_on_project.add(role)
+
+        has_broad_or_matching_role = bool(
+            user_roles_on_project
+            & {
+                "roles/owner",
+                "roles/editor",
+                "roles/agentgateway.admin",
+                "roles/networkservices.admin",
+                "roles/agentregistry.admin",
+                "roles/iam.accessPolicyAdmin",
+                "roles/iam.policyBindingAdmin",
+                "roles/orgpolicy.policyAdmin",
+                "roles/discoveryengine.admin",
+            }
+        )
+
+        for group_title, role_hint, perm_items in LEAST_PRIVILEGE_PERMISSION_GROUPS:
+            rows: list[tuple[str, str, str]] = []
+            for perm, desc in perm_items:
+                if not auth_ok:
+                    status_label = "UNVERIFIED"
+                    unverified_count += 1
+                elif perm in granted_perms:
+                    status_label = "GRANTED"
+                    granted_count += 1
+                elif perm in untestable_perms and has_broad_or_matching_role:
+                    status_label = "GRANTED (role)"
+                    granted_count += 1
+                elif perm in untestable_perms:
+                    status_label = "UNVERIFIED (v3/α)"
+                    unverified_count += 1
+                else:
+                    status_label = "MISSING"
+                    missing_count += 1
+                rows.append((perm, status_label, desc))
+            perm_group_rows.append((group_title, role_hint, rows))
+
+        # 1C. Service Agents & SPIFFE
+        expected_sa_bindings: list[tuple[str, str, str]] = [
+            (
+                f"serviceAccount:service-{disp_proj_num}@gcp-sa-discoveryengine.iam.gserviceaccount.com",
+                "roles/discoveryengine.serviceAgent",
+                "Allows Gemini Enterprise to manage collections, connectors & egress",
+            ),
+            (
+                f"serviceAccount:service-{disp_proj_num}@gcp-sa-discoveryengine.iam.gserviceaccount.com",
+                "roles/agentregistry.TempServiceAgent",
+                "Allows Gemini Enterprise to read MCP server schemas in Agent Registry",
+            ),
+            (
+                f"serviceAccount:service-{disp_proj_num}@gcp-sa-agentgateway.iam.gserviceaccount.com",
+                "roles/agentgateway.serviceAgent",
+                "Allows Agent Gateway to attach PSC endpoints to the Network Attachment",
+            ),
+            (
+                f"serviceAccount:service-{disp_proj_num}@gcp-sa-networkservices.iam.gserviceaccount.com",
+                "roles/networkservices.serviceAgent",
+                "Allows Network Services to provision Secure Web Proxy & connectivity",
+            ),
+            (
+                f"serviceAccount:service-{disp_proj_num}@gcp-sa-iap.iam.gserviceaccount.com",
+                "roles/iap.egressServiceAgent",
+                "Allows IAP V2 AuthzExtension to evaluate IAM v3 egress policies",
+            ),
+        ]
+        existing_role_members: dict[str, set[str]] = {}
+        if iam_policy:
+            for b in iam_policy.get("bindings", []):
+                existing_role_members.setdefault(b.get("role", ""), set()).update(
+                    b.get("members", [])
+                )
+        for member, role, purpose in expected_sa_bindings:
+            short_member = member.replace("serviceAccount:", "")
+            if not auth_ok or not iam_policy:
+                st_label = "UNVERIFIED"
+            elif member in existing_role_members.get(role, set()):
+                st_label = "GRANTED"
+            else:
+                st_label = "MISSING"
+            sa_rows.append((short_member, role, st_label, purpose))
+
+        ap_exists = (
+            bool(
+                gcloud_json(
+                    ["iam", "access-policies", "describe", d["iap_policy_name"], "--location=global"],
+                    project_id,
+                )
+            )
+            if auth_ok
+            else False
+        )
+        pb_exists = (
+            bool(
+                gcloud_json(
+                    ["iam", "policy-bindings", "describe", d["iap_binding_name"], "--location=global"],
+                    project_id,
+                )
+            )
+            if auth_ok
+            else False
+        )
+        if not auth_ok:
+            spiffe_st_label = "UNVERIFIED"
+        elif ap_exists and pb_exists:
+            spiffe_st_label = "GRANTED (BOUND)"
+        else:
+            spiffe_st_label = "MISSING"
+        spiffe_row = (
+            f"SPIFFE: .../engines/{engine_id}/.../core_assistant",
+            "iap.googleapis.com/resources.egressViaIAP",
+            spiffe_st_label,
+        )
+
+        # 1D. Org Policies
+        for constraint, req_desc in ORG_POLICY_CONSTRAINTS:
+            if not auth_ok:
+                lbl = "UNVERIFIED"
+            else:
+                pol = gcloud_json(
+                    ["org-policies", "describe", constraint, "--effective"],
+                    project_id=project_id,
+                )
+                enforced = False
+                if pol:
+                    for rule in pol.get("spec", {}).get("rules", []):
+                        if rule.get("enforce") is True:
+                            enforced = True
+                lbl = "ENABLED (NOT BLOCKING)" if not enforced else "BLOCKING (ENFORCED)"
+            org_policy_rows.append((constraint, lbl, req_desc))
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PART 1: PERMISSIONS, APIS, SERVICE AGENTS & ORG POLICIES + LIVE STATUS
+    # ═══════════════════════════════════════════════════════════════════════════
+    if show_perms:
+        header("PART 1: Least-Privilege Permissions, APIs, Service Agents & Org Policies (Live Status)")
+        print(f"  {BOLD}Target Project:{RESET}        {project_id} (projectNumber: {disp_proj_num}, orgId: {disp_org_id})")
+        print(f"  {BOLD}Active Principal:{RESET}      {active_account or 'None'}")
+        print(f"  {BOLD}Auth Token Status:{RESET}     {f'{GREEN}AUTHENTICATED{RESET}' if auth_ok else f'{YELLOW}REAUTH REQUIRED (`gcloud auth login`){RESET}'}")
+        print(f"  {BOLD}Gateway / NAT Region:{RESET}  {region} (paired with geapp location: {ge_location})")
+
+        # ── 1A. Required GCP Service APIs ─────────────────────────────────────
+        print(f"\n{BOLD}[1A] Required GCP Service APIs ({len(api_rows)} APIs){RESET}")
+        print(f"  {'API Service Name':<38} {'Status':<18} {'Purpose'}")
+        print(f"  {'─' * 38} {'─' * 18} {'─' * 58}")
+        for api_name, _title, st_label, purpose in api_rows:
+            color = GREEN if st_label == "ENABLED" else (RED if st_label == "DISABLED" else YELLOW)
+            pad = max(1, 18 - len(st_label))
+            print(f"  {api_name:<38} {color}{st_label}{RESET}{' ' * pad} {purpose}")
+
+        # ── 1B. Least-Privilege Deployer IAM Permissions ──────────────────────
+        print(f"\n{BOLD}[1B] Least-Privilege Deployer IAM Permissions (Granular — Avoid Generalist Roles){RESET}")
+        print(
+            f"  {CYAN}Security Principle:{RESET} Do NOT grant generalist roles such as `roles/owner`, "
+            "`roles/editor`,\n  `roles/compute.admin`, or `roles/iam.securityAdmin`. Below is the "
+            "minimal set of granular\n  permissions required across each component and their current "
+            "status for your active account."
+        )
+
+        for group_title, role_hint, rows in perm_group_rows:
+            print(f"\n  {BOLD}{group_title}{RESET}")
+            print(f"  {CYAN}Restrictive Predefined Role Alternative:{RESET} {role_hint}")
+            print(f"    {'Permission':<50} {'Status':<18} {'Scope / Operation'}")
+            print(f"    {'─' * 50} {'─' * 18} {'─' * 46}")
+            for perm, status_label, desc in rows:
+                color = (
+                    GREEN
+                    if status_label.startswith("GRANTED")
+                    else (RED if status_label == "MISSING" else YELLOW)
+                )
+                pad = max(1, 18 - len(status_label))
+                print(f"    {perm:<50} {color}{status_label}{RESET}{' ' * pad} {desc}")
+
+        print(
+            f"\n  {BOLD}Deployer Permission Summary:{RESET} "
+            f"{GREEN}{granted_count} granted{RESET}  |  "
+            f"{RED}{missing_count} missing{RESET}  |  "
+            f"{YELLOW}{unverified_count} unverified{RESET}  "
+            f"(Total: {len(all_perms)} permissions)"
+        )
+
+        custom_role_perms = ",".join(all_perms)
+        print(
+            f"\n  {BOLD}Least-Privilege Custom Role Command (Recommended over predefined roles):{RESET}\n"
+            f"    gcloud iam roles create staticAgentGatewayDeployer \\\n"
+            f"      --project={project_id} \\\n"
+            f"      --title=\"Static IP Agent Gateway & MCP Deployer\" \\\n"
+            f"      --description=\"Least-privilege role to deploy Agent Gateway + Cloud NAT static IP for Gemini Enterprise MCP\" \\\n"
+            f"      --permissions=\"{custom_role_perms}\"\n"
+            f"    gcloud projects add-iam-policy-binding {project_id} \\\n"
+            f"      --member=\"user:{active_account or '<YOUR_EMAIL>'}\" \\\n"
+            f"      --role=\"projects/{project_id}/roles/staticAgentGatewayDeployer\""
+        )
+
+        # ── 1C. Google-Managed Service Agent & Runtime SPIFFE IAM Bindings ────
+        print(f"\n{BOLD}[1C] Required Google-Managed Service Agent & Runtime SPIFFE Bindings{RESET}")
+        print(f"  {'Service Agent / Principal':<68} {'Role / Permission':<36} {'Status'}")
+        print(f"  {'─' * 68} {'─' * 36} {'─' * 16}")
+        for short_member, role, st_label, _purpose in sa_rows:
+            color = GREEN if st_label == "GRANTED" else (RED if st_label == "MISSING" else YELLOW)
+            print(f"  {short_member:<68} {role:<36} {color}{st_label}{RESET}")
+
+        spiffe_label, spiffe_perm, spiffe_st_label = spiffe_row
+        spiffe_color = (
+            GREEN
+            if spiffe_st_label.startswith("GRANTED")
+            else (RED if spiffe_st_label == "MISSING" else YELLOW)
+        )
+        print(f"  {spiffe_label:<68} {spiffe_perm:<36} {spiffe_color}{spiffe_st_label}{RESET}")
+
+        # ── 1D. Organization Policy Constraints ───────────────────────────────
+        print(f"\n{BOLD}[1D] Organization Policy Constraints (Must Not Block Custom MCP or IAM v3){RESET}")
+        print(f"  {'Constraint Name':<54} {'Current Status':<24} {'Requirement'}")
+        print(f"  {'─' * 54} {'─' * 24} {'─' * 46}")
+        for constraint, lbl, req_desc in org_policy_rows:
+            color = (
+                GREEN
+                if lbl.startswith("ENABLED")
+                else (RED if lbl.startswith("BLOCKING") else YELLOW)
+            )
+            pad = max(1, 24 - len(lbl))
+            print(f"  {constraint:<54} {color}{lbl}{RESET}{' ' * pad} {req_desc}")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PART 2: STEP-BY-STEP MANUAL DEPLOYMENT GUIDE USING THE GCP CONSOLE
+    # ═══════════════════════════════════════════════════════════════════════════
+    if show_guide:
+        header("PART 2: Step-by-Step Manual Deployment Guide Using the GCP Console")
+        print(
+            f"  This guide walks through manually deploying the complete Static Outbound IP\n"
+            f"  Agent Gateway architecture in the Google Cloud Console using the exact settings\n"
+            f"  from your configuration file ({BOLD}project={project_id}{RESET}, "
+            f"{BOLD}gateway_region={region}{RESET}, {BOLD}geapp={geapp_name}{RESET}).\n"
+        )
+
+        # ── Phase 1 ───────────────────────────────────────────────────────────
+        print(f"{BOLD}Phase 1: Enable APIs, Verify Service Agents & Check Org Policies{RESET}")
+        print(
+            f"  1. {BOLD}Enable Required APIs (APIs & Services > Library){RESET}\n"
+            f"     • Open: https://console.cloud.google.com/apis/library?project={project_id}\n"
+            f"     • Search for and click {BOLD}Enable{RESET} on each of the following APIs:\n"
+            f"       - Compute Engine API (`compute.googleapis.com`)\n"
+            f"       - Discovery Engine API (`discoveryengine.googleapis.com`)\n"
+            f"       - Network Services API (`networkservices.googleapis.com`)\n"
+            f"       - Network Security API (`networksecurity.googleapis.com`)\n"
+            f"       - Service Extensions API (`serviceextensions.googleapis.com`)\n"
+            f"       - Identity-Aware Proxy API (`iap.googleapis.com`)\n"
+            f"       - Agent Registry API (`agentregistry.googleapis.com`)\n"
+            f"       - Organization Policy API (`orgpolicy.googleapis.com`)\n"
+            f"       - Cloud Resource Manager API (`cloudresourcemanager.googleapis.com`)\n"
+            f"\n"
+            f"  2. {BOLD}Grant Google-Managed Service Agent Roles (IAM & Admin > IAM){RESET}\n"
+            f"     • Open: https://console.cloud.google.com/iam-admin/iam?project={project_id}\n"
+            f"     • Check {BOLD}\"Include Google-provided role grants\"{RESET} at the top right of the IAM table.\n"
+            f"     • Click {BOLD}Grant Access{RESET} to add any missing service agent role bindings:\n"
+            f"       - Principal: `service-{disp_proj_num}@gcp-sa-discoveryengine.iam.gserviceaccount.com`\n"
+            f"         Roles: `Discovery Engine Service Agent` (`roles/discoveryengine.serviceAgent`),\n"
+            f"                `Agent Registry Temp Service Agent` (`roles/agentregistry.TempServiceAgent`)\n"
+            f"       - Principal: `service-{disp_proj_num}@gcp-sa-agentgateway.iam.gserviceaccount.com`\n"
+            f"         Role:  `Agent Gateway Service Agent` (`roles/agentgateway.serviceAgent`)\n"
+            f"       - Principal: `service-{disp_proj_num}@gcp-sa-networkservices.iam.gserviceaccount.com`\n"
+            f"         Role:  `Network Services Service Agent` (`roles/networkservices.serviceAgent`)\n"
+            f"       - Principal: `service-{disp_proj_num}@gcp-sa-iap.iam.gserviceaccount.com`\n"
+            f"         Role:  `IAP Egress Service Agent` (`roles/iap.egressServiceAgent`)\n"
+            f"     • Note: If a service agent email does not exist yet, initialize it once in Cloud Shell:\n"
+            f"       `gcloud beta services identity create --service=<api>.googleapis.com --project={project_id}`\n"
+            f"\n"
+            f"  3. {BOLD}Verify Organization Policies (IAM & Admin > Organization Policies){RESET}\n"
+            f"     • Open: https://console.cloud.google.com/iam-admin/orgpolicies/list?project={project_id}\n"
+            f"     • Filter for each constraint below; if any is enforced, click it -> {BOLD}Manage policy{RESET} ->\n"
+            f"       {BOLD}Override parent's policy{RESET} -> set Enforcement to {BOLD}Off{RESET} (`enforce: false`) -> {BOLD}Set policy{RESET}:\n"
+            f"       - `iam.managed.disableAccessPolicyBinding`\n"
+            f"       - `discoveryengine.SkipCustomMcpRestriction`\n"
+            f"       - `discoveryengine.managed.disableCustomMcpServerConnector`\n"
+            f"       - `discoveryengine.managed.allowedEgressFqdns`\n"
+            f"       - `discoveryengine.managed.allowedDataSources`\n"
+        )
+
+        # ── Phase 2 ───────────────────────────────────────────────────────────
+        print(f"{BOLD}Phase 2: Create VPC, PSC Subnet, Static External IP, Cloud NAT & PSC Attachment{RESET}")
+        print(
+            f"  {YELLOW}Important Regional Alignment:{RESET} Because your Gemini Enterprise app is in\n"
+            f"  `{ge_location}`, ALL networking and Agent Gateway resources MUST be created in `{region}`.\n"
+            f"\n"
+            f"  1. {BOLD}Create Custom VPC Network & PSC Subnet (VPC network > VPC networks){RESET}\n"
+            f"     • Open: https://console.cloud.google.com/networking/networks/add?project={project_id}\n"
+            f"     • {BOLD}Name:{RESET} `{d['vpc_name']}`\n"
+            f"     • {BOLD}Subnet creation mode:{RESET} Select {BOLD}Custom{RESET}\n"
+            f"     • Under {BOLD}New subnet{RESET}, configure:\n"
+            f"       - {BOLD}Name:{RESET} `{d['psc_subnet_name']}`\n"
+            f"       - {BOLD}Region:{RESET} `{region}`\n"
+            f"       - {BOLD}IP stack type:{RESET} `IPv4 (single-stack)`\n"
+            f"       - {BOLD}IPv4 range:{RESET} `{psc_cidr}` (must be `/28` or larger for PSC Network Attachment)\n"
+            f"       - {BOLD}Private Google Access:{RESET} Select {BOLD}On{RESET}\n"
+            f"     • Click {BOLD}Done{RESET} on the subnet, leave firewall rules unchecked, and click {BOLD}Create{RESET}.\n"
+            f"\n"
+            f"  2. {BOLD}Reserve Regional Static External IPv4 Address (VPC network > IP addresses){RESET}\n"
+            f"     • Open: https://console.cloud.google.com/networking/addresses/add?project={project_id}\n"
+            f"     • {BOLD}Name:{RESET} `{d['nat_ip_name']}`\n"
+            f"     • {BOLD}Network Service Tier:{RESET} `Premium`\n"
+            f"     • {BOLD}IP version:{RESET} `IPv4`\n"
+            f"     • {BOLD}Type:{RESET} `Regional`\n"
+            f"     • {BOLD}Region:{RESET} `{region}`\n"
+            f"     • {BOLD}Attached to:{RESET} `None` (will be assigned to Cloud NAT in the next step)\n"
+            f"     • Click {BOLD}Reserve{RESET} and copy the allocated IPv4 address ({BOLD}{disp_static_ip}{RESET}).\n"
+            f"\n"
+            f"  3. {BOLD}Create Cloud Router & Cloud NAT Gateway (Network Services > Cloud NAT){RESET}\n"
+            f"     • Open: https://console.cloud.google.com/net-services/nat/add?project={project_id}\n"
+            f"     • {BOLD}Gateway name:{RESET} `{d['nat_name']}`\n"
+            f"     • {BOLD}NAT type:{RESET} `Public`\n"
+            f"     • {BOLD}Cloud Router:{RESET}\n"
+            f"       - {BOLD}Network:{RESET} `{d['vpc_name']}`\n"
+            f"       - {BOLD}Region:{RESET} `{region}`\n"
+            f"       - Select {BOLD}Create new router{RESET} -> Name: `{d['router_name']}` -> click {BOLD}Create{RESET}\n"
+            f"     • {BOLD}Cloud NAT mapping:{RESET} `All subnets (primary and secondary IP ranges)`\n"
+            f"     • {BOLD}Cloud NAT IP addresses:{RESET}\n"
+            f"       - Select {BOLD}Manual{RESET} (do NOT use Automatic or traffic will use ephemeral IPs)\n"
+            f"       - {BOLD}IP address 1:{RESET} Select `{d['nat_ip_name']}` ({disp_static_ip})\n"
+            f"     • Expand {BOLD}Advanced configurations{RESET} -> under {BOLD}Logging{RESET}, select {BOLD}Translation and errors{RESET}.\n"
+            f"     • Click {BOLD}Create{RESET}.\n"
+            f"\n"
+            f"  4. {BOLD}Create PSC Network Attachment (Network Services > Private Service Connect){RESET}\n"
+            f"     • Open: https://console.cloud.google.com/net-services/psc/list?tab=networkAttachments&project={project_id}\n"
+            f"     • Click {BOLD}Create network attachment{RESET}:\n"
+            f"       - {BOLD}Name:{RESET} `{d['attachment_name']}`\n"
+            f"       - {BOLD}Region:{RESET} `{region}`\n"
+            f"       - {BOLD}Network:{RESET} `{d['vpc_name']}`\n"
+            f"       - {BOLD}Subnetworks:{RESET} Select `{d['psc_subnet_name']}`\n"
+            f"       - {BOLD}Connection preference:{RESET} Select {BOLD}Accept connections automatically (Accept all){RESET}\n"
+            f"     • Click {BOLD}Create{RESET}.\n"
+        )
+
+        # ── Phase 3 ───────────────────────────────────────────────────────────
+        print(f"{BOLD}Phase 3: Register the Remote MCP Server in Agent Registry{RESET}")
+        print(
+            f"  1. {BOLD}Verify Remote MCP Server HTTPS Endpoint{RESET}\n"
+            f"     • Ensure your MCP server is running behind HTTPS with a publicly trusted CA certificate\n"
+            f"       at `{mcp_url}` (Agent Gateway's Secure Web Proxy uses TLS SNI inspection and rejects\n"
+            f"       plain HTTP or bare IP URLs with HTTP 404 `default_denied`).\n"
+            f"\n"
+            f"  2. {BOLD}Create Agent Registry Service Entry{RESET}\n"
+            f"     • Open Agent Registry in the Console (or click the {BOLD}Activate Cloud Shell{RESET} `>_` icon\n"
+            f"       in the top-right Console toolbar if the regional `tool-spec` editor is not shown):\n"
+            f"       - {BOLD}Location:{RESET} `{region}`\n"
+            f"       - {BOLD}Service ID:{RESET} `{d['mcp_reg_name']}`\n"
+            f"       - {BOLD}Display Name:{RESET} `{d['connector_display_name']}`\n"
+            f"       - {BOLD}Protocol Binding:{RESET} `JSONRPC`\n"
+            f"       - {BOLD}Endpoint URL:{RESET} `{mcp_url}`\n"
+            f"       - {BOLD}MCP Tool Spec:{RESET} JSON schema defining `hello` and `hello_from_ip`\n"
+            f"     • Equivalent Cloud Shell command in the Console:\n"
+            f"       ```bash\n"
+            f"       cat <<'EOF' > /tmp/toolspec.json\n"
+            f"{json.dumps(DEFAULT_MCP_TOOLS_SPEC, indent=2)}\n"
+            f"EOF\n"
+            f"       gcloud agent-registry services create {d['mcp_reg_name']} \\\n"
+            f"         --location={region} \\\n"
+            f"         --display-name=\"{d['connector_display_name']}\" \\\n"
+            f"         --interfaces=\"protocolBinding=JSONRPC,url={mcp_url}\" \\\n"
+            f"         --mcp-server-spec-type=tool-spec \\\n"
+            f"         --mcp-server-spec-content=/tmp/toolspec.json \\\n"
+            f"         --project={project_id}\n"
+            f"       ```\n"
+        )
+
+        # ── Phase 4 ───────────────────────────────────────────────────────────
+        print(f"{BOLD}Phase 4: Provision AgentConnectivityTemplate (ALL_TRAFFIC) & Agent Gateway{RESET}")
+        print(
+            f"  1. {BOLD}Create the AgentConnectivityTemplate (`vpcEgress: ALL_TRAFFIC`){RESET}\n"
+            f"     • Navigate to {BOLD}Network Services > Agent Gateway{RESET} (or open the Console {BOLD}Cloud Shell{RESET}\n"
+            f"       to import the alpha YAML specification below):\n"
+            f"       - {BOLD}Name:{RESET} `{d['act_name']}` (Location: `{region}`)\n"
+            f"       - {BOLD}Access Path:{RESET} `AGENT_TO_ANYWHERE`\n"
+            f"       - {BOLD}Deployment Model:{RESET} `CENTRALIZED`\n"
+            f"       - {BOLD}Network Attachment:{RESET} `projects/{project_id}/regions/{region}/networkAttachments/{d['attachment_name']}`\n"
+            f"       - {BOLD}VPC Egress:{RESET} `ALL_TRAFFIC` (routes all public internet MCP calls into your PSC subnet)\n"
+            f"     • Console Cloud Shell YAML import:\n"
+            f"       ```bash\n"
+            f"       cat <<'EOF' > /tmp/act.yaml\n"
+            f"       accessPath: AGENT_TO_ANYWHERE\n"
+            f"       name: projects/{disp_proj_num}/locations/{region}/agentConnectivityTemplates/{d['act_name']}\n"
+            f"       deploymentModel: CENTRALIZED\n"
+            f"       egressNetworkConfig:\n"
+            f"         networkAttachment: projects/{project_id}/regions/{region}/networkAttachments/{d['attachment_name']}\n"
+            f"         vpcEgress: ALL_TRAFFIC\n"
+            f"       EOF\n"
+            f"       gcloud alpha network-services agent-connectivity-templates import {d['act_name']} \\\n"
+            f"         --location={region} --source=/tmp/act.yaml --project={project_id}\n"
+            f"       ```\n"
+            f"\n"
+            f"  2. {BOLD}Create the Agent Gateway (`AGENT_TO_ANYWHERE`){RESET}\n"
+            f"     • Configure the Agent Gateway in `{region}` linked to the Connectivity Template and Registry:\n"
+            f"       ```bash\n"
+            f"       cat <<'EOF' > /tmp/agw.yaml\n"
+            f"       name: {d['agw_name']}\n"
+            f"       protocols:\n"
+            f"         - MCP\n"
+            f"       googleManaged:\n"
+            f"         governedAccessPath: AGENT_TO_ANYWHERE\n"
+            f"       agentConnectivityTemplate: projects/{disp_proj_num}/locations/{region}/agentConnectivityTemplates/{d['act_name']}\n"
+            f"       registries:\n"
+            f"         - //agentregistry.googleapis.com/projects/{project_id}/locations/{region}\n"
+            f"       EOF\n"
+            f"       gcloud alpha network-services agent-gateways import {d['agw_name']} \\\n"
+            f"         --location={region} --source=/tmp/agw.yaml --project={project_id}\n"
+            f"       ```\n"
+        )
+
+        # ── Phase 5 ───────────────────────────────────────────────────────────
+        print(f"{BOLD}Phase 5: Configure IAP V2 AuthzExtension, AuthzPolicy & IAM v3 Access Policy{RESET}")
+        print(
+            f"  1. {BOLD}Create the Service Extensions AuthzExtension (Network Services > Service Extensions){RESET}\n"
+            f"     • Open: https://console.cloud.google.com/net-services/service-extensions/list?project={project_id}\n"
+            f"     • Create an `AuthzExtension` in `{region}` (or import via Cloud Shell):\n"
+            f"       - {BOLD}Name:{RESET} `{d['authz_ext_name']}` | {BOLD}Region:{RESET} `{region}`\n"
+            f"       - {BOLD}Service:{RESET} `iap.googleapis.com` | {BOLD}Fail Open:{RESET} `false` | {BOLD}Timeout:{RESET} `1s`\n"
+            f"       - {BOLD}Metadata:{RESET} `iapPolicyVersion: V2`\n"
+            f"       ```bash\n"
+            f"       cat <<'EOF' > /tmp/authz-ext.yaml\n"
+            f"       name: {d['authz_ext_name']}\n"
+            f"       service: iap.googleapis.com\n"
+            f"       failOpen: false\n"
+            f"       timeout: 1s\n"
+            f"       metadata:\n"
+            f"         iapPolicyVersion: V2\n"
+            f"       EOF\n"
+            f"       gcloud service-extensions authz-extensions import {d['authz_ext_name']} \\\n"
+            f"         --location={region} --source=/tmp/authz-ext.yaml --project={project_id}\n"
+            f"       ```\n"
+            f"\n"
+            f"  2. {BOLD}Create the Network Security AuthzPolicy (Network Security > Authorization Policies){RESET}\n"
+            f"     • Open: https://console.cloud.google.com/net-security/authz-policies/list?project={project_id}\n"
+            f"     • Create an `AuthzPolicy` in `{region}` targeting the Agent Gateway:\n"
+            f"       - {BOLD}Name:{RESET} `{d['authz_policy_name']}` | {BOLD}Region:{RESET} `{region}`\n"
+            f"       - {BOLD}Target Resource:{RESET} `projects/{project_id}/locations/{region}/agentGateways/{d['agw_name']}`\n"
+            f"       - {BOLD}Policy Profile:{RESET} `REQUEST_AUTHZ` | {BOLD}Action:{RESET} `CUSTOM`\n"
+            f"       - {BOLD}AuthzExtension:{RESET} `projects/{project_id}/locations/{region}/authzExtensions/{d['authz_ext_name']}`\n"
+            f"       ```bash\n"
+            f"       cat <<'EOF' > /tmp/authz-policy.yaml\n"
+            f"       name: {d['authz_policy_name']}\n"
+            f"       target:\n"
+            f"         resources:\n"
+            f"           - projects/{project_id}/locations/{region}/agentGateways/{d['agw_name']}\n"
+            f"       policyProfile: REQUEST_AUTHZ\n"
+            f"       action: CUSTOM\n"
+            f"       customProvider:\n"
+            f"         authzExtension:\n"
+            f"           resources:\n"
+            f"             - projects/{project_id}/locations/{region}/authzExtensions/{d['authz_ext_name']}\n"
+            f"       EOF\n"
+            f"       gcloud network-security authz-policies import {d['authz_policy_name']} \\\n"
+            f"         --location={region} --source=/tmp/authz-policy.yaml --project={project_id}\n"
+            f"       ```\n"
+            f"\n"
+            f"  3. {BOLD}Create IAM v3 AccessPolicy & PolicyBinding for the geapp SPIFFE Identity{RESET}\n"
+            f"     • Authorize your Gemini Enterprise `default_assistant` workload identity to egress via IAP\n"
+            f"       to any MCP service registered in Agent Registry (`destination.is_registered == true`):\n"
+            f"       ```bash\n"
+            f"       cat <<'EOF' > /tmp/iap_rules.json\n"
+            f"       [\n"
+            f"         {{\n"
+            f"           \"description\": \"allow geapp {engine_id} assistant to any registered service\",\n"
+            f"           \"effect\": \"ALLOW\",\n"
+            f"           \"principals\": [\n"
+            f"             \"principal://agents.global.org-{disp_org_id}.system.id.goog/resources/discoveryengine/projects/{disp_proj_num}/locations/{ge_location}/engines/{engine_id}/assistants/default_assistant/agents/default/core_assistant\",\n"
+            f"             \"principal://agents.global.org-{disp_org_id}.system.id.goog/resources/aiplatform/projects/{disp_proj_num}/locations/{ge_location}/collections/default_collection/engines/{engine_id}/assistants/default_assistant\"\n"
+            f"           ],\n"
+            f"           \"operation\": {{\"permissions\": [\"iap.googleapis.com/resources.egressViaIAP\"]}},\n"
+            f"           \"conditions\": {{\"iap.googleapis.com\": {{\"expression\": \"destination.is_registered == true\"}}}}\n"
+            f"         }}\n"
+            f"       ]\n"
+            f"       EOF\n"
+            f"       gcloud iam access-policies create {d['iap_policy_name']} \\\n"
+            f"         --location=global --display-name={d['iap_policy_name']} \\\n"
+            f"         --details-rules=/tmp/iap_rules.json --project={project_id}\n"
+            f"       gcloud iam policy-bindings create {d['iap_binding_name']} \\\n"
+            f"         --location=global \\\n"
+            f"         --policy=\"projects/{project_id}/locations/global/accessPolicies/{d['iap_policy_name']}\" \\\n"
+            f"         --target-resource=\"//cloudresourcemanager.googleapis.com/projects/{project_id}\" \\\n"
+            f"         --project={project_id}\n"
+            f"       ```\n"
+        )
+
+        # ── Phase 6 ───────────────────────────────────────────────────────────
+        print(f"{BOLD}Phase 6: Wire Agent Gateway & Custom MCP Connector in Gemini Enterprise Console{RESET}")
+        print(
+            f"  1. {BOLD}Bind Default Egress Agent Gateway to the Gemini Enterprise App{RESET}\n"
+            f"     • Open: https://console.cloud.google.com/gen-app-builder/engines?project={project_id}\n"
+            f"     • Select your existing Gemini Enterprise App: `{geapp_name}` (Engine ID: `{engine_id}`, Location: `{ge_location}`).\n"
+            f"     • In {BOLD}App Settings > Agent Gateway / Egress{RESET}, set {BOLD}Default Egress Agent Gateway{RESET} to:\n"
+            f"       `projects/{project_id}/locations/{region}/agentGateways/{d['agw_name']}`\n"
+            f"\n"
+            f"  2. {BOLD}Create & Activate the Custom MCP Connector (`REGISTRY_MCP`){RESET}\n"
+            f"     • Open: https://console.cloud.google.com/gen-app-builder/data-stores?project={project_id}\n"
+            f"     • Click {BOLD}Create Data Store / Add Connector{RESET} -> select {BOLD}Custom MCP Server (`custom_mcp`){RESET}:\n"
+            f"       - {BOLD}Location:{RESET} `{ge_location}`\n"
+            f"       - {BOLD}Collection / Connector ID:{RESET} `{d['connector_id']}`\n"
+            f"       - {BOLD}Display Name:{RESET} `{d['connector_display_name']}`\n"
+            f"       - {BOLD}Connector Mode:{RESET} `FEDERATED` (Entity: `mcp_data`)\n"
+            f"       - {BOLD}MCP Server Source:{RESET} `REGISTRY_MCP`\n"
+            f"       - {BOLD}Registry MCP Server Name:{RESET} `projects/{project_id}/locations/{region}/mcpServers/<MCP_SERVER_ID>`\n"
+            f"       - {BOLD}Instance URI:{RESET} `{mcp_url}`\n"
+            f"       - {BOLD}Auth Type:{RESET} `NO_AUTH`\n"
+            f"       - {BOLD}Use Agent Gateway Egress (`use_agent_gateway_egress`):{RESET} `true` (Enabled)\n"
+            f"       - {BOLD}Agent Gateway Engine:{RESET} `projects/{project_id}/locations/{ge_location}/collections/default_collection/engines/{engine_id}`\n"
+            f"     • Attach the resulting `{d['connector_id']}_mcp_data` Data Store to your `{engine_id}` App\n"
+            f"       (and detach any older non-Agent-Gateway MCP Data Stores targeting `{mcp_url}`).\n"
+        )
+
+        # ── Phase 7 ───────────────────────────────────────────────────────────
+        print(f"{BOLD}Phase 7: Verify Static Outbound IP in Console Preview & Cloud Logging{RESET}")
+        print(
+            f"  1. {BOLD}Test from Gemini Enterprise Web App / Console Preview{RESET}\n"
+            f"     • Open your `{geapp_name}` app preview in the Console and ask:\n"
+            f"       `Call hello_from_ip for Raul and tell me what IP address the MCP server sees`\n"
+            f"     • Confirm that the returned IP address matches your reserved Cloud NAT Static IP:\n"
+            f"       {GREEN}{BOLD}{disp_static_ip}{RESET}\n"
+            f"\n"
+            f"  2. {BOLD}Verify Egress & SNAT in Cloud Logging (Logs Explorer){RESET}\n"
+            f"     • Open: https://console.cloud.google.com/logs/query?project={project_id}\n"
+            f"     • {BOLD}Agent Gateway & IAP Authz trace query:{RESET}\n"
+            f"       `resource.type=\"networkservices.googleapis.com/Gateway\" AND resource.labels.location=\"{region}\"`\n"
+            f"     • {BOLD}Cloud NAT Static IP translation query:{RESET}\n"
+            f"       `resource.type=\"nat_gateway\" AND resource.labels.gateway_name=\"{d['nat_name']}\"`\n"
+            f"\n"
+            f"  3. {BOLD}Lock Down the Remote MCP Server Firewall (Recommended){RESET}\n"
+            f"     • Restrict inbound TCP port `443` on your remote MCP server firewall to source CIDR\n"
+            f"       `{disp_static_ip}/32` so only requests routed through your Agent Gateway + Cloud NAT\n"
+            f"       can reach the MCP server.\n"
+        )
+
+    if output_path:
+        md_content = _render_instructions_markdown(
+            project_id=project_id,
+            disp_proj_num=disp_proj_num,
+            disp_org_id=disp_org_id,
+            active_account=active_account,
+            auth_ok=auth_ok,
+            region=region,
+            ge_location=ge_location,
+            geapp_name=geapp_name,
+            engine_id=engine_id,
+            mcp_url=mcp_url,
+            psc_cidr=psc_cidr,
+            disp_static_ip=disp_static_ip,
+            d=d,
+            show_perms=show_perms,
+            show_guide=show_guide,
+            api_rows=api_rows,
+            perm_group_rows=perm_group_rows,
+            granted_count=granted_count,
+            missing_count=missing_count,
+            unverified_count=unverified_count,
+            all_perms=all_perms,
+            sa_rows=sa_rows,
+            spiffe_row=spiffe_row,
+            org_policy_rows=org_policy_rows,
+        )
+        out_abs = os.path.abspath(output_path)
+        out_dir = os.path.dirname(out_abs)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_abs, "w", encoding="utf-8") as f:
+            f.write(md_content)
+        success(f"Wrote Markdown instructions to: {BOLD}{out_abs}{RESET}")
+
+
 # ─── CLI Entrypoint ──────────────────────────────────────────────────────────
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1921,6 +3283,27 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "preflight",
         help="Validate config.yaml, regional alignment, gcloud auth, org policies, and geapp",
+    )
+    inst_p = sub.add_parser(
+        "instructions",
+        help="Print least-privilege permissions/APIs status and manual GCP Console deployment guide",
+    )
+    inst_group = inst_p.add_mutually_exclusive_group()
+    inst_group.add_argument(
+        "--permissions-only",
+        action="store_true",
+        help="Print only Part 1 (permissions, APIs, service agents, and org policies status)",
+    )
+    inst_group.add_argument(
+        "--guide-only",
+        action="store_true",
+        help="Print only Part 2 (step-by-step manual GCP Console deployment guide)",
+    )
+    inst_p.add_argument(
+        "-o",
+        "--output",
+        metavar="FILENAME.md",
+        help="Write the full instructions output as formatted Markdown to FILENAME.md",
     )
     sub.add_parser(
         "deploy",
@@ -1956,6 +3339,7 @@ def main() -> None:
 
     dispatch = {
         "preflight": cmd_preflight,
+        "instructions": cmd_instructions,
         "deploy": cmd_deploy,
         "describe": cmd_describe,
         "undeploy": cmd_undeploy,
